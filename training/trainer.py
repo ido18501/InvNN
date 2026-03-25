@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict
+
+import torch
+from tqdm.auto import tqdm
+
+from training.collate import TangentBatch
+
+
+@dataclass
+class TrainOutput:
+    loss: float
+    stats: Dict[str, float]
+
+
+class TangentTrainer:
+    def __init__(self, model, optimizer, loss_fn, device, grad_clip_norm=None, checkpoint_dir='checkpoints'):
+        self.model = model
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+        self.device = torch.device(device)
+        self.grad_clip_norm = grad_clip_norm
+        self.model.to(self.device)
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
+
+    def _move_batch(self, batch: TangentBatch) -> TangentBatch:
+        batch.anchor = batch.anchor.to(self.device)
+        batch.positive = batch.positive.to(self.device)
+        batch.negatives = batch.negatives.to(self.device)
+        batch.transform_matrix = batch.transform_matrix.to(self.device)
+        batch.gt_first_anchor = batch.gt_first_anchor.to(self.device)
+        batch.gt_second_anchor = batch.gt_second_anchor.to(self.device)
+        batch.has_analytic_derivatives = batch.has_analytic_derivatives.to(self.device)
+        return batch
+
+    def _forward_triplet(self, batch: TangentBatch):
+        anchor_out = self.model(batch.anchor)
+        positive_out = self.model(batch.positive)
+
+        B, M, P, C = batch.negatives.shape
+        flat_neg = batch.negatives.view(B * M, P, C)
+        neg_out = self.model(flat_neg)
+        return anchor_out, positive_out, neg_out
+
+    @staticmethod
+    def _cosine_and_angle(pred: torch.Tensor, gt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pred_n = pred / (pred.norm(dim=-1, keepdim=True) + 1e-8)
+        gt_n = gt / (gt.norm(dim=-1, keepdim=True) + 1e-8)
+        cos = (pred_n * gt_n).sum(dim=-1).clamp(-1.0, 1.0)
+        angle = torch.rad2deg(torch.acos(cos))
+        return cos, angle
+
+    def _derivative_metrics(
+        self,
+        *,
+        vector_first: torch.Tensor,
+        vector_second: torch.Tensor,
+        gt_first: torch.Tensor,
+        gt_second: torch.Tensor,
+        has_analytic: torch.Tensor,
+    ) -> Dict[str, float]:
+        valid = has_analytic.bool() & torch.isfinite(gt_first).all(dim=-1) & torch.isfinite(gt_second).all(dim=-1)
+        if valid.sum().item() == 0:
+            return {
+                'analytic_fraction': 0.0,
+                'first_cosine_mean': float('nan'),
+                'second_cosine_mean': float('nan'),
+                'first_angle_deg_mean': float('nan'),
+                'second_angle_deg_mean': float('nan'),
+                'first_mse': float('nan'),
+                'second_mse': float('nan'),
+                'pred_first_norm_mean': float('nan'),
+                'pred_second_norm_mean': float('nan'),
+                'gt_first_norm_mean': float('nan'),
+                'gt_second_norm_mean': float('nan'),
+            }
+
+        vector_first = vector_first[valid]
+        vector_second = vector_second[valid]
+        gt_first = gt_first[valid]
+        gt_second = gt_second[valid]
+
+        first_cos, first_angle = self._cosine_and_angle(vector_first, gt_first)
+        second_cos, second_angle = self._cosine_and_angle(vector_second, gt_second)
+
+        return {
+            'analytic_fraction': float(valid.float().mean().item()),
+            'first_cosine_mean': float(first_cos.mean().item()),
+            'second_cosine_mean': float(second_cos.mean().item()),
+            'first_angle_deg_mean': float(first_angle.mean().item()),
+            'second_angle_deg_mean': float(second_angle.mean().item()),
+            'first_mse': float(torch.mean((vector_first - gt_first) ** 2).item()),
+            'second_mse': float(torch.mean((vector_second - gt_second) ** 2).item()),
+            'pred_first_norm_mean': float(vector_first.norm(dim=-1).mean().item()),
+            'pred_second_norm_mean': float(vector_second.norm(dim=-1).mean().item()),
+            'gt_first_norm_mean': float(gt_first.norm(dim=-1).mean().item()),
+            'gt_second_norm_mean': float(gt_second.norm(dim=-1).mean().item()),
+        }
+
+    def train_step(self, batch: TangentBatch) -> TrainOutput:
+        self.model.train()
+        batch = self._move_batch(batch)
+        self.optimizer.zero_grad(set_to_none=True)
+
+        anchor_out, positive_out, neg_out = self._forward_triplet(batch)
+        B, M = batch.negatives.shape[:2]
+        neg_emb = neg_out['embedding'].view(B, M, -1)
+
+        loss, stats = self.loss_fn(
+            embedding_anchor=anchor_out['embedding'],
+            embedding_positive=positive_out['embedding'],
+            embedding_negatives=neg_emb,
+            weights_anchor=anchor_out['weights'],
+            return_stats=True,
+        )
+        loss.backward()
+
+        if self.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+        self.optimizer.step()
+
+        with torch.no_grad():
+            stats.update(
+                self._derivative_metrics(
+                    vector_first=anchor_out['vector_first'],
+                    vector_second=anchor_out['vector_second'],
+                    gt_first=batch.gt_first_anchor,
+                    gt_second=batch.gt_second_anchor,
+                    has_analytic=batch.has_analytic_derivatives,
+                )
+            )
+        return TrainOutput(loss=float(loss.item()), stats=stats)
+
+    @torch.no_grad()
+    def eval_step(self, batch: TangentBatch) -> TrainOutput:
+        self.model.eval()
+        batch = self._move_batch(batch)
+        anchor_out, positive_out, neg_out = self._forward_triplet(batch)
+        B, M = batch.negatives.shape[:2]
+        neg_emb = neg_out['embedding'].view(B, M, -1)
+
+        loss, stats = self.loss_fn(
+            embedding_anchor=anchor_out['embedding'],
+            embedding_positive=positive_out['embedding'],
+            embedding_negatives=neg_emb,
+            weights_anchor=anchor_out['weights'],
+            return_stats=True,
+        )
+        stats.update(
+            self._derivative_metrics(
+                vector_first=anchor_out['vector_first'],
+                vector_second=anchor_out['vector_second'],
+                gt_first=batch.gt_first_anchor,
+                gt_second=batch.gt_second_anchor,
+                has_analytic=batch.has_analytic_derivatives,
+            )
+        )
+        return TrainOutput(loss=float(loss.item()), stats=stats)
+
+    def _run_loader(self, loader, train: bool, desc: str):
+        metrics = {}
+        n = 0
+        iterator = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+        for batch in iterator:
+            out = self.train_step(batch) if train else self.eval_step(batch)
+            for k, v in out.stats.items():
+                if isinstance(v, float) and (v != v):
+                    continue
+                metrics[k] = metrics.get(k, 0.0) + float(v)
+            n += 1
+            if 'loss' in out.stats:
+                iterator.set_postfix(loss=f"{out.stats['loss']:.4f}")
+        for k in list(metrics.keys()):
+            metrics[k] /= max(n, 1)
+        return metrics
+
+    def _print_epoch_summary(self, epoch: int, train_metrics: Dict[str, float], val_metrics: Dict[str, float]) -> None:
+        print(f"\nEpoch {epoch}", flush=True)
+        print(
+            "train | "
+            f"loss={train_metrics.get('loss', float('nan')):.4f} "
+            f"inv={train_metrics.get('inv_loss', float('nan')):.4f} "
+            f"var={train_metrics.get('var_loss', float('nan')):.4f} "
+            f"cov={train_metrics.get('cov_loss', float('nan')):.4f} "
+            f"neg={train_metrics.get('neg_loss', float('nan')):.4f} "
+            f"reg={train_metrics.get('reg_loss', float('nan')):.6f}",
+            flush=True,
+        )
+        print(
+            "train emergence | "
+            f"cos1={train_metrics.get('first_cosine_mean', float('nan')):.4f} "
+            f"cos2={train_metrics.get('second_cosine_mean', float('nan')):.4f} "
+            f"ang1={train_metrics.get('first_angle_deg_mean', float('nan')):.2f}° "
+            f"ang2={train_metrics.get('second_angle_deg_mean', float('nan')):.2f}° "
+            f"mse1={train_metrics.get('first_mse', float('nan')):.6f} "
+            f"mse2={train_metrics.get('second_mse', float('nan')):.6f}",
+            flush=True,
+        )
+        print(
+            "val   | "
+            f"loss={val_metrics.get('loss', float('nan')):.4f} "
+            f"inv={val_metrics.get('inv_loss', float('nan')):.4f} "
+            f"var={val_metrics.get('var_loss', float('nan')):.4f} "
+            f"cov={val_metrics.get('cov_loss', float('nan')):.4f} "
+            f"neg={val_metrics.get('neg_loss', float('nan')):.4f} "
+            f"reg={val_metrics.get('reg_loss', float('nan')):.6f}",
+            flush=True,
+        )
+        print(
+            "val emergence   | "
+            f"cos1={val_metrics.get('first_cosine_mean', float('nan')):.4f} "
+            f"cos2={val_metrics.get('second_cosine_mean', float('nan')):.4f} "
+            f"ang1={val_metrics.get('first_angle_deg_mean', float('nan')):.2f}° "
+            f"ang2={val_metrics.get('second_angle_deg_mean', float('nan')):.2f}° "
+            f"mse1={val_metrics.get('first_mse', float('nan')):.6f} "
+            f"mse2={val_metrics.get('second_mse', float('nan')):.6f} "
+            f"analytic={val_metrics.get('analytic_fraction', float('nan')):.2f}",
+            flush=True,
+        )
+
+    def fit(self, train_loader, val_loader, num_epochs, early_stopping_patience=10):
+        best_val = float('inf')
+        best_epoch = 0
+        patience = 0
+        best_model_path = self.checkpoint_dir / 'best_model.pt'
+
+        for epoch in range(1, num_epochs + 1):
+            train_metrics = self._run_loader(train_loader, train=True, desc=f'train {epoch}/{num_epochs}')
+            val_metrics = self._run_loader(val_loader, train=False, desc=f'val   {epoch}/{num_epochs}')
+            val_loss = val_metrics.get('loss', float('inf'))
+            self._print_epoch_summary(epoch, train_metrics, val_metrics)
+
+            if val_loss < best_val:
+                best_val = val_loss
+                best_epoch = epoch
+                patience = 0
+                torch.save(self.model.state_dict(), best_model_path)
+                print('✓ saved new best model', flush=True)
+            else:
+                patience += 1
+                print(f'no improvement ({patience}/{early_stopping_patience})', flush=True)
+
+            if patience >= early_stopping_patience:
+                print('Early stopping triggered', flush=True)
+                break
+
+        print(f'\nBest validation epoch: {best_epoch}', flush=True)
+        self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+        return best_model_path
+
+    def evaluate(self, loader, split_name='test'):
+        metrics = self._run_loader(loader, train=False, desc=f'{split_name}')
+        print(f'\n{split_name.capitalize()} metrics', flush=True)
+        print(metrics, flush=True)
+        print(
+            f"{split_name} emergence | "
+            f"cos1={metrics.get('first_cosine_mean', float('nan')):.4f} "
+            f"cos2={metrics.get('second_cosine_mean', float('nan')):.4f} "
+            f"ang1={metrics.get('first_angle_deg_mean', float('nan')):.2f}° "
+            f"ang2={metrics.get('second_angle_deg_mean', float('nan')):.2f}° "
+            f"mse1={metrics.get('first_mse', float('nan')):.6f} "
+            f"mse2={metrics.get('second_mse', float('nan')):.6f}",
+            flush=True,
+        )
+        return metrics

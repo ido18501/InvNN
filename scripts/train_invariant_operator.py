@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+
+from datasets.tangent_dataset import TangentDataset
+from models.tangent_model import TangentOperatorModel
+from training.collate import tangent_collate_fn
+from training.losses import InvariantOperatorLoss
+from training.trainer import TangentTrainer
+
+
+
+def parse_int_list(s: str) -> list[int]:
+    return [int(x) for x in s.split(',') if x.strip()]
+
+
+
+def add_dataset_args(p: argparse.ArgumentParser, prefix: str):
+    p.add_argument(f'--{prefix}-source', type=str, default='generated', choices=['generated', 'pregenerated'])
+    p.add_argument(f'--{prefix}-bank', type=str, default=None)
+    p.add_argument(f'--{prefix}-length', type=int, default=4096)
+
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--family', type=str, default='affine', choices=['euclidean', 'similarity', 'equi_affine', 'affine'])
+    add_dataset_args(p, 'train')
+    add_dataset_args(p, 'val')
+    add_dataset_args(p, 'test')
+
+    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--batch-size', type=int, default=128)
+    p.add_argument('--num-epochs', type=int, default=40)
+    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument('--grad-clip-norm', type=float, default=1.0)
+    p.add_argument('--early-stopping-patience', type=int, default=10)
+    p.add_argument('--seed', type=int, default=123)
+    p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--checkpoint-dir', type=str, required=True)
+
+    p.add_argument('--patch-size', type=int, default=9)
+    p.add_argument('--half-width', type=int, default=12)
+    p.add_argument('--num-negatives', type=int, default=8)
+    p.add_argument('--negative-min-offset', type=int, default=5)
+    p.add_argument('--negative-max-offset', type=int, default=25)
+    p.add_argument('--negative-other-curve-fraction', type=float, default=0.5)
+    p.add_argument('--patch-mode', type=str, default='random_warp_symmetric')
+    p.add_argument('--jitter-fraction', type=float, default=0.25)
+    p.add_argument('--warp-sampling-prob', type=float, default=0.7)
+    p.add_argument('--warp-sampling-strength', type=float, default=0.18)
+    p.add_argument('--num-curve-points', type=int, default=1000)
+    p.add_argument('--fourier-max-freq', type=int, default=5)
+    p.add_argument('--fourier-scale', type=float, default=0.9)
+    p.add_argument('--fourier-decay-power', type=float, default=2.0)
+
+    p.add_argument('--point-mlp-dims', type=str, default='64,64,128')
+    p.add_argument('--projector-dims', type=str, default='128')
+    p.add_argument('--head-dims', type=str, default='128,64')
+    p.add_argument('--invariant-dim', type=int, default=64)
+    p.add_argument('--point-dropout', type=float, default=0.0)
+    p.add_argument('--head-dropout', type=float, default=0.0)
+    p.add_argument('--disable-batchnorm', action='store_true')
+    p.add_argument('--disable-normalize-embedding', action='store_true')
+    p.add_argument('--disable-center-weights', action='store_true')
+
+    p.add_argument('--lambda-inv', type=float, default=25.0)
+    p.add_argument('--lambda-var', type=float, default=25.0)
+    p.add_argument('--lambda-cov', type=float, default=1.0)
+    p.add_argument('--lambda-neg', type=float, default=1.0)
+    p.add_argument('--lambda-reg', type=float, default=1e-4)
+    p.add_argument('--variance-target', type=float, default=1.0)
+    p.add_argument('--negative-margin', type=float, default=0.25)
+
+    return p.parse_args()
+
+
+
+def make_dataset(args, split: str) -> TangentDataset:
+    source = getattr(args, f'{split}_source')
+    bank = getattr(args, f'{split}_bank')
+    length = getattr(args, f'{split}_length')
+    return TangentDataset(
+        length=length,
+        family=args.family,
+        source=source,
+        bank_path=bank,
+        num_curve_points=args.num_curve_points,
+        fourier_max_freq=args.fourier_max_freq,
+        fourier_scale=args.fourier_scale,
+        fourier_decay_power=args.fourier_decay_power,
+        patch_size=args.patch_size,
+        half_width=args.half_width,
+        num_negatives=args.num_negatives,
+        negative_min_offset=args.negative_min_offset,
+        negative_max_offset=args.negative_max_offset,
+        negative_other_curve_fraction=args.negative_other_curve_fraction,
+        patch_mode=args.patch_mode,
+        jitter_fraction=args.jitter_fraction,
+        warp_sampling_prob=args.warp_sampling_prob,
+        warp_sampling_strength=args.warp_sampling_strength,
+        seed=args.seed + {'train': 0, 'val': 10000, 'test': 20000}[split],
+    )
+
+
+
+def main():
+    args = parse_args()
+    torch.manual_seed(args.seed)
+
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / 'config.json').write_text(json.dumps(vars(args), indent=2))
+
+    train_dataset = make_dataset(args, 'train')
+    val_dataset = make_dataset(args, 'val')
+    test_dataset = make_dataset(args, 'test')
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=tangent_collate_fn,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=tangent_collate_fn,
+        drop_last=False,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=tangent_collate_fn,
+        drop_last=False,
+    )
+
+    model = TangentOperatorModel(
+        patch_size=args.patch_size,
+        point_mlp_dims=parse_int_list(args.point_mlp_dims),
+        projector_dims=parse_int_list(args.projector_dims),
+        head_dims=parse_int_list(args.head_dims),
+        invariant_dim=args.invariant_dim,
+        use_batchnorm=not args.disable_batchnorm,
+        point_dropout=args.point_dropout,
+        head_dropout=args.head_dropout,
+        normalize_embedding=not args.disable_normalize_embedding,
+        center_weights=not args.disable_center_weights,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_fn = InvariantOperatorLoss(
+        lambda_inv=args.lambda_inv,
+        lambda_var=args.lambda_var,
+        lambda_cov=args.lambda_cov,
+        lambda_neg=args.lambda_neg,
+        lambda_reg=args.lambda_reg,
+        variance_target=args.variance_target,
+        negative_margin=args.negative_margin,
+    )
+
+    trainer = TangentTrainer(
+        model=model,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        device=args.device,
+        grad_clip_norm=args.grad_clip_norm,
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    best_model_path = trainer.fit(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=args.num_epochs,
+        early_stopping_patience=args.early_stopping_patience,
+    )
+    print(f'Best model saved at: {best_model_path}')
+    trainer.evaluate(test_loader, split_name='test')
+
+
+if __name__ == '__main__':
+    main()
