@@ -5,42 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SharedMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dims: list[int], use_batchnorm: bool = True, dropout: float = 0.0) -> None:
-        super().__init__()
-        if len(hidden_dims) == 0:
-            raise ValueError('hidden_dims must contain at least one layer.')
-        layers = []
-        prev_dim = in_dim
-        for dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, dim))
-            if use_batchnorm:
-                layers.append(nn.BatchNorm1d(dim))
-            layers.append(nn.ReLU())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            prev_dim = dim
-        self.layers = nn.ModuleList(layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f'Expected input shape (B, P, C), got {tuple(x.shape)}')
-        B, P, _ = x.shape
-        out = x
-        for layer in self.layers:
-            if isinstance(layer, nn.BatchNorm1d):
-                out = out.reshape(B * P, -1)
-                out = layer(out)
-                out = out.reshape(B, P, -1)
-            else:
-                out = layer(out)
-        return out
-
-
 class MLPHead(nn.Module):
     def __init__(self, in_dim: int, hidden_dims: list[int], out_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
-        layers = []
+        layers: list[nn.Module] = []
         prev = in_dim
         for dim in hidden_dims:
             layers.append(nn.Linear(prev, dim))
@@ -57,112 +25,147 @@ class MLPHead(nn.Module):
 
 class TangentOperatorModel(nn.Module):
     """
-    Learn one patch stencil W and train it through *equivariance*.
+    Predict a KxK operator *per patch*.
 
-    Important:
-    - the loss should compare W(Tx) to T(Wx), not W(x) to W(Tx)
-    - the raw equivariance loss must care about magnitude, so downstream code
-      should use the full transformed vector, not cosine alone
-    - analytic derivatives remain diagnostics only
+    For an input patch X with shape [B, K, 2], the model predicts
+        W(X) in R^{B x K x K}
+    and applies it on the sample-index dimension:
+        Y1 = W(X) X
+        Y2 = W(X) Y1
+
+    The same predicted operator is applied to the x- and y-coordinate channels
+    separately; there is no x/y channel mixing inside W.
+
+    Equivariance is enforced on the *action* of the predicted operator:
+        W(TX) TX  ~=  T(W(X) X)
+    where T(p) = A p + b, and only the linear part A acts on the output field.
+    The translation bias b is intentionally ignored there, just like a true
+    derivative operator would do once row sums are near zero.
     """
 
     def __init__(
         self,
         patch_size: int,
-        point_dim: int = 2,
-        point_mlp_dims: list[int] | None = None,
-        trunk_dims: list[int] | None = None,
-        head_dims: list[int] | None = None,
-        projector_dims: list[int] | None = None,
-        projector_out_dim: int = 64,
-        use_batchnorm: bool = True,
-        point_dropout: float = 0.0,
+        *,
+        operator_hidden_dims: list[int] | None = None,
+        signature_hidden_dims: list[int] | None = None,
+        signature_out_dim: int = 64,
+        signature_center_radius: int = 0,
         head_dropout: float = 0.0,
         normalize_projector: bool = True,
-        center_weights: bool = True,
+        init_scale: float = 0.05,
+        center_operator: bool = True,
+        operator_bandwidth: int | None = None,
+        learn_scale: bool = False,
+        centered_input_for_operator: bool = True,
     ) -> None:
         super().__init__()
-        if point_mlp_dims is None:
-            point_mlp_dims = [64, 64, 128]
-        if trunk_dims is None:
-            trunk_dims = [128]
-        if head_dims is None:
-            head_dims = [128, 64]
-        if projector_dims is None:
-            projector_dims = [64, 64]
+        if operator_hidden_dims is None:
+            operator_hidden_dims = [256, 256]
+        if signature_hidden_dims is None:
+            signature_hidden_dims = [128, 64]
 
         self.patch_size = int(patch_size)
+        self.center_index = self.patch_size // 2
+        self.signature_center_radius = int(signature_center_radius)
         self.normalize_projector = bool(normalize_projector)
-        self.center_weights = bool(center_weights)
+        self.center_operator = bool(center_operator)
+        self.centered_input_for_operator = bool(centered_input_for_operator)
 
-        self.point_encoder = SharedMLP(
-            in_dim=point_dim,
-            hidden_dims=point_mlp_dims,
-            use_batchnorm=use_batchnorm,
-            dropout=point_dropout,
-        )
-        feature_dim = point_mlp_dims[-1]
-        pooled_dim = 2 * feature_dim
+        rows = torch.arange(self.patch_size).view(-1, 1)
+        cols = torch.arange(self.patch_size).view(1, -1)
+        if operator_bandwidth is not None:
+            bw = int(operator_bandwidth)
+            op_mask = ((rows - cols).abs() <= bw).float()
+        else:
+            op_mask = torch.ones(self.patch_size, self.patch_size)
+        self.register_buffer('operator_mask', op_mask)
 
-        self.trunk = MLPHead(
-            in_dim=pooled_dim,
-            hidden_dims=trunk_dims,
-            out_dim=trunk_dims[-1],
-            dropout=head_dropout,
-        )
-        trunk_dim = trunk_dims[-1]
+        operator_in_dim = self.patch_size * 2
         self.operator_head = MLPHead(
-            in_dim=trunk_dim,
-            hidden_dims=head_dims,
-            out_dim=self.patch_size,
+            in_dim=operator_in_dim,
+            hidden_dims=operator_hidden_dims,
+            out_dim=self.patch_size * self.patch_size,
             dropout=head_dropout,
         )
-        self.projector = MLPHead(
-            in_dim=2,
-            hidden_dims=projector_dims,
-            out_dim=projector_out_dim,
+        self.operator_init_scale = float(init_scale)
+
+        signature_rows = 2 * self.signature_center_radius + 1
+        signature_in_dim = signature_rows * 2
+        self.signature_head = MLPHead(
+            in_dim=signature_in_dim,
+            hidden_dims=signature_hidden_dims,
+            out_dim=signature_out_dim,
             dropout=head_dropout,
         )
 
-    def _pool_patch(self, x: torch.Tensor) -> torch.Tensor:
-        point_features = self.point_encoder(x)
-        mean_feat = point_features.mean(dim=1)
-        max_feat = point_features.max(dim=1).values
-        return torch.cat([mean_feat, max_feat], dim=-1)
+        self.output_scale = nn.Parameter(torch.tensor(1.0)) if learn_scale else None
+        self._init_last_layer()
 
-    @staticmethod
-    def _apply_weights(weights: torch.Tensor, patch: torch.Tensor) -> torch.Tensor:
-        return torch.einsum('bp,bpd->bd', weights, patch)
+    def _init_last_layer(self) -> None:
+        last = self.operator_head.net[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.normal_(last.weight, mean=0.0, std=self.operator_init_scale)
+            nn.init.zeros_(last.bias)
 
-    def project_vectors(self, vectors: torch.Tensor) -> torch.Tensor:
-        if vectors.ndim != 2 or vectors.shape[-1] != 2:
-            raise ValueError(f'Expected vectors shape (B, 2), got {tuple(vectors.shape)}')
-        projection = self.projector(vectors)
+    def _prepare_operator_input(self, x: torch.Tensor) -> torch.Tensor:
+        if self.centered_input_for_operator:
+            x = x - x.mean(dim=1, keepdim=True)
+        return x.reshape(x.shape[0], -1)
+
+    def get_operator(self, x: torch.Tensor) -> torch.Tensor:
+        flat = self._prepare_operator_input(x)
+        op = self.operator_head(flat).view(x.shape[0], self.patch_size, self.patch_size)
+        op = op * self.operator_mask.unsqueeze(0)
+        if self.center_operator:
+            op = op - op.mean(dim=-1, keepdim=True)
+        return op
+
+    def _apply_operator(self, operator: torch.Tensor, patch: torch.Tensor) -> torch.Tensor:
+        # operator: [B,K,K], patch: [B,K,2] -> [B,K,2]
+        out = torch.einsum('bij,bjd->bid', operator, patch)
+        if self.output_scale is not None:
+            out = self.output_scale * out
+        return out
+
+    def get_center_vectors(self, field: torch.Tensor) -> torch.Tensor:
+        return field[:, self.center_index, :]
+
+    def _extract_signature_slice(self, field: torch.Tensor) -> torch.Tensor:
+        left = max(0, self.center_index - self.signature_center_radius)
+        right = min(self.patch_size, self.center_index + self.signature_center_radius + 1)
+        window = field[:, left:right, :]
+        return window.reshape(field.shape[0], -1)
+
+    def project_field(self, field: torch.Tensor) -> torch.Tensor:
+        projection = self.signature_head(self._extract_signature_slice(field))
         if self.normalize_projector:
             projection = F.normalize(projection, dim=-1)
         return projection
 
+    @staticmethod
+    def apply_linear_map_to_field(transform_matrix: torch.Tensor, field: torch.Tensor) -> torch.Tensor:
+        # field [B,K,2], transform_matrix [B,2,2] => [B,K,2]
+        return torch.einsum('bkd,bed->bke', field, transform_matrix)
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         if x.ndim != 3 or x.shape[-1] != 2:
-            raise ValueError(f'Expected input shape (B, P, 2), got {tuple(x.shape)}')
+            raise ValueError(f'Expected input shape (B, K, 2), got {tuple(x.shape)}')
+        if x.shape[1] != self.patch_size:
+            raise ValueError(f'Expected patch size {self.patch_size}, got {x.shape[1]}')
 
-        pooled = self._pool_patch(x)
-        trunk_feature = self.trunk(pooled)
-
-        weights = self.operator_head(trunk_feature)
-        if self.center_weights:
-            weights = weights - weights.mean(dim=-1, keepdim=True)
-
-        vector_first = self._apply_weights(weights, x)
-        weighted_patch = weights.unsqueeze(-1) * x
-        vector_second = self._apply_weights(weights, weighted_patch)
-        projection = self.project_vectors(vector_first)
+        operator = self.get_operator(x)
+        field_first = self._apply_operator(operator, x)
+        field_second = self._apply_operator(operator, field_first)
+        center_first = self.get_center_vectors(field_first)
+        center_second = self.get_center_vectors(field_second)
+        projection = self.project_field(field_first)
 
         return {
-            'trunk_feature': trunk_feature,
-            'weights': weights,
-            'vector': vector_first,
-            'vector_first': vector_first,
-            'vector_second': vector_second,
+            'operator': operator,
+            'field_first': field_first,
+            'field_second': field_second,
+            'center_first': center_first,
+            'center_second': center_second,
             'projection': projection,
         }

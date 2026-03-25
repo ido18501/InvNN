@@ -10,37 +10,41 @@ from torch.utils.data import DataLoader
 from datasets.tangent_dataset import TangentDataset
 from models.tangent_model import TangentOperatorModel
 from training.collate import tangent_collate_fn
-from training.losses import EquivariantContrastiveOperatorLoss
+from training.losses import EquivariantMatrixOperatorLoss
 from training.trainer import TangentTrainer
 
 
-def parse_int_list(s: str) -> list[int]:
-    return [int(x) for x in s.split(',') if x.strip()]
-
-
-def add_dataset_args(p: argparse.ArgumentParser, prefix: str):
-    p.add_argument(f'--{prefix}-source', type=str, default='generated', choices=['generated', 'pregenerated'])
-    p.add_argument(f'--{prefix}-bank', type=str, default=None)
-    p.add_argument(f'--{prefix}-length', type=int, default=4096)
+def parse_int_list(text: str) -> list[int]:
+    text = text.strip()
+    if not text:
+        return []
+    return [int(x.strip()) for x in text.split(',') if x.strip()]
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--family', type=str, default='affine', choices=['euclidean', 'similarity', 'equi_affine', 'affine'])
-    add_dataset_args(p, 'train')
-    add_dataset_args(p, 'val')
-    add_dataset_args(p, 'test')
+    p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--seed', type=int, default=123)
+    p.add_argument('--checkpoint-dir', type=str, required=True)
 
-    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--train-source', type=str, default='generated', choices=['generated', 'pregenerated'])
+    p.add_argument('--val-source', type=str, default='generated', choices=['generated', 'pregenerated'])
+    p.add_argument('--test-source', type=str, default='generated', choices=['generated', 'pregenerated'])
+    p.add_argument('--train-bank', type=str, default=None)
+    p.add_argument('--val-bank', type=str, default=None)
+    p.add_argument('--test-bank', type=str, default=None)
+    p.add_argument('--train-length', type=int, default=4096)
+    p.add_argument('--val-length', type=int, default=1024)
+    p.add_argument('--test-length', type=int, default=1024)
+
     p.add_argument('--batch-size', type=int, default=128)
+    p.add_argument('--num-workers', type=int, default=4)
     p.add_argument('--num-epochs', type=int, default=40)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--grad-clip-norm', type=float, default=1.0)
     p.add_argument('--early-stopping-patience', type=int, default=10)
-    p.add_argument('--seed', type=int, default=123)
-    p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    p.add_argument('--checkpoint-dir', type=str, required=True)
 
     p.add_argument('--patch-size', type=int, default=9)
     p.add_argument('--half-width', type=int, default=12)
@@ -57,23 +61,24 @@ def parse_args():
     p.add_argument('--fourier-scale', type=float, default=0.9)
     p.add_argument('--fourier-decay-power', type=float, default=2.0)
 
-    p.add_argument('--point-mlp-dims', type=str, default='64,64,128')
-    p.add_argument('--trunk-dims', type=str, default='128')
-    p.add_argument('--head-dims', type=str, default='128,64')
-    p.add_argument('--projector-dims', type=str, default='64,64')
-    p.add_argument('--projector-out-dim', type=int, default=64)
-    p.add_argument('--point-dropout', type=float, default=0.0)
+    p.add_argument('--operator-hidden-dims', type=str, default='256,256')
+    p.add_argument('--signature-hidden-dims', type=str, default='128,64')
+    p.add_argument('--signature-out-dim', type=int, default=64)
+    p.add_argument('--signature-center-radius', type=int, default=0)
     p.add_argument('--head-dropout', type=float, default=0.0)
-    p.add_argument('--disable-batchnorm', action='store_true')
     p.add_argument('--disable-normalize-projector', action='store_true')
-    p.add_argument('--disable-center-weights', action='store_true')
+    p.add_argument('--disable-center-operator', action='store_true')
+    p.add_argument('--disable-centered-input-for-operator', action='store_true')
+    p.add_argument('--operator-bandwidth', type=int, default=None)
+    p.add_argument('--operator-init-scale', type=float, default=0.05)
+    p.add_argument('--learn-output-scale', action='store_true')
 
     p.add_argument('--temperature', type=float, default=0.1)
     p.add_argument('--lambda-nce', type=float, default=1.0)
     p.add_argument('--lambda-eq', type=float, default=1.0)
     p.add_argument('--lambda-sum', type=float, default=0.1)
     p.add_argument('--lambda-reg', type=float, default=1e-4)
-
+    p.add_argument('--lambda-loc', type=float, default=0.0)
     return p.parse_args()
 
 
@@ -104,6 +109,14 @@ def make_dataset(args, split: str) -> TangentDataset:
     )
 
 
+def build_locality_matrix(patch_size: int) -> torch.Tensor:
+    idx = torch.arange(patch_size, dtype=torch.float32)
+    distance = (idx[:, None] - idx[None, :]).abs()
+    if patch_size <= 1:
+        return torch.zeros((patch_size, patch_size), dtype=torch.float32)
+    return distance / float(patch_size - 1)
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -116,71 +129,37 @@ def main():
     val_dataset = make_dataset(args, 'val')
     test_dataset = make_dataset(args, 'test')
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=tangent_collate_fn,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=tangent_collate_fn,
-        drop_last=False,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=tangent_collate_fn,
-        drop_last=False,
-    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=tangent_collate_fn, drop_last=False)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=tangent_collate_fn, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=tangent_collate_fn, drop_last=False)
 
     model = TangentOperatorModel(
         patch_size=args.patch_size,
-        point_mlp_dims=parse_int_list(args.point_mlp_dims),
-        trunk_dims=parse_int_list(args.trunk_dims),
-        head_dims=parse_int_list(args.head_dims),
-        projector_dims=parse_int_list(args.projector_dims),
-        projector_out_dim=args.projector_out_dim,
-        use_batchnorm=not args.disable_batchnorm,
-        point_dropout=args.point_dropout,
+        operator_hidden_dims=parse_int_list(args.operator_hidden_dims),
+        signature_hidden_dims=parse_int_list(args.signature_hidden_dims),
+        signature_out_dim=args.signature_out_dim,
+        signature_center_radius=args.signature_center_radius,
         head_dropout=args.head_dropout,
         normalize_projector=not args.disable_normalize_projector,
-        center_weights=not args.disable_center_weights,
+        center_operator=not args.disable_center_operator,
+        operator_bandwidth=args.operator_bandwidth,
+        init_scale=args.operator_init_scale,
+        learn_scale=args.learn_output_scale,
+        centered_input_for_operator=not args.disable_centered_input_for_operator,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = EquivariantContrastiveOperatorLoss(
+    loss_fn = EquivariantMatrixOperatorLoss(
         temperature=args.temperature,
         lambda_nce=args.lambda_nce,
         lambda_eq=args.lambda_eq,
         lambda_sum=args.lambda_sum,
         lambda_reg=args.lambda_reg,
+        lambda_loc=args.lambda_loc,
+        locality_matrix=build_locality_matrix(args.patch_size),
     )
 
-    trainer = TangentTrainer(
-        model=model,
-        optimizer=optimizer,
-        loss_fn=loss_fn,
-        device=args.device,
-        grad_clip_norm=args.grad_clip_norm,
-        checkpoint_dir=checkpoint_dir,
-    )
-
-    best_model_path = trainer.fit(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_epochs=args.num_epochs,
-        early_stopping_patience=args.early_stopping_patience,
-    )
+    trainer = TangentTrainer(model=model, optimizer=optimizer, loss_fn=loss_fn, device=args.device, grad_clip_norm=args.grad_clip_norm, checkpoint_dir=checkpoint_dir)
+    best_model_path = trainer.fit(train_loader=train_loader, val_loader=val_loader, num_epochs=args.num_epochs, early_stopping_patience=args.early_stopping_patience)
     print(f'Best model saved at: {best_model_path}')
     trainer.evaluate(test_loader, split_name='test')
 

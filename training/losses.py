@@ -5,17 +5,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class EquivariantContrastiveOperatorLoss(nn.Module):
+class EquivariantMatrixOperatorLoss(nn.Module):
     """
-    Train an operator through *equivariance*, not invariance.
+    Objective for a patch-conditioned KxK operator W(X).
 
-    Positive pair:
-        g(T(W(x)))   <->   g(W(Tx))
-    not:
-        g(W(x))      <->   g(W(Tx))
+    Optimized terms:
+    - full-field equivariance on the *action*: W(TX) TX ~= T(W(X) X)
+      where only the linear part A of T(p)=Ap+b acts on the output field.
+    - equivariant contrastive loss on field signatures
+    - row-sum zero per predicted operator, to kill translation bias / constants
+    - Frobenius regularization
+    - optional locality penalty away from the diagonal
 
-    The raw equivariance term uses full vector MSE, so magnitude matters.
-    No analytic derivative enters this loss.
+    No derivative labels enter this loss.
     """
 
     def __init__(
@@ -26,6 +28,8 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
         lambda_eq: float = 1.0,
         lambda_sum: float = 0.1,
         lambda_reg: float = 1e-4,
+        lambda_loc: float = 0.0,
+        locality_matrix: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.temperature = float(temperature)
@@ -33,10 +37,11 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
         self.lambda_eq = float(lambda_eq)
         self.lambda_sum = float(lambda_sum)
         self.lambda_reg = float(lambda_reg)
-
-    @staticmethod
-    def _apply_linear_map(transform_matrix: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:
-        return torch.einsum('bij,bj->bi', transform_matrix, vectors)
+        self.lambda_loc = float(lambda_loc)
+        if locality_matrix is None:
+            self.register_buffer('locality_matrix', torch.empty(0))
+        else:
+            self.register_buffer('locality_matrix', locality_matrix.float())
 
     def _info_nce(
         self,
@@ -61,44 +66,52 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
     def forward(
         self,
         *,
-        vector_anchor: torch.Tensor,
-        vector_positive: torch.Tensor,
+        field_anchor_equivariant: torch.Tensor,
+        field_positive: torch.Tensor,
         proj_anchor_equivariant: torch.Tensor,
         proj_positive: torch.Tensor,
         proj_negatives: torch.Tensor,
-        weights_anchor: torch.Tensor,
-        transform_matrix: torch.Tensor,
+        operator_matrix: torch.Tensor,
         return_stats: bool = False,
     ):
-        target_vector = self._apply_linear_map(transform_matrix, vector_anchor)
-
-        # Full equivariance: direction + magnitude.
-        eq_raw_loss = F.mse_loss(vector_positive, target_vector)
-
+        eq_raw_loss = F.mse_loss(field_positive, field_anchor_equivariant)
         nce_loss, pos_sim, neg_sim = self._info_nce(
             proj_anchor_equivariant=proj_anchor_equivariant,
             proj_positive=proj_positive,
             proj_negatives=proj_negatives,
         )
 
-        sum_loss = weights_anchor.sum(dim=-1).pow(2).mean()
-        reg_loss = weights_anchor.pow(2).mean()
+        row_sum = operator_matrix.sum(dim=-1)
+        sum_loss = row_sum.pow(2).mean()
+        reg_loss = operator_matrix.pow(2).mean()
+
+        if self.locality_matrix.numel() == 0 or self.lambda_loc == 0.0:
+            loc_loss = operator_matrix.new_tensor(0.0)
+        else:
+            loc_penalty = self.locality_matrix.to(operator_matrix.device).unsqueeze(0)
+            loc_loss = (loc_penalty * operator_matrix.pow(2)).mean()
 
         loss = (
             self.lambda_nce * nce_loss
             + self.lambda_eq * eq_raw_loss
             + self.lambda_sum * sum_loss
             + self.lambda_reg * reg_loss
+            + self.lambda_loc * loc_loss
         )
 
         if not return_stats:
             return loss
 
         with torch.no_grad():
-            eq_cos = F.cosine_similarity(vector_positive, target_vector, dim=-1)
-            target_norm = target_vector.norm(dim=-1)
-            positive_norm = vector_positive.norm(dim=-1)
-            norm_mse = F.mse_loss(positive_norm, target_norm)
+            eq_cos = F.cosine_similarity(
+                field_positive.reshape(field_positive.shape[0], -1),
+                field_anchor_equivariant.reshape(field_anchor_equivariant.shape[0], -1),
+                dim=-1,
+            )
+            field_positive_norm = field_positive.norm(dim=(-1, -2))
+            field_target_norm = field_anchor_equivariant.norm(dim=(-1, -2))
+            norm_mse = F.mse_loss(field_positive_norm, field_target_norm)
+            op_fro = operator_matrix.pow(2).sum(dim=(-1, -2)).sqrt()
             stats = {
                 'loss': float(loss.item()),
                 'nce_loss': float(nce_loss.item()),
@@ -106,14 +119,11 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
                 'eq_norm_mse': float(norm_mse.item()),
                 'sum_loss': float(sum_loss.item()),
                 'reg_loss': float(reg_loss.item()),
+                'loc_loss': float(loc_loss.item()),
                 'eq_cos_mean': float(eq_cos.mean().item()),
-                'eq_angle_deg_mean': float(torch.rad2deg(torch.acos(eq_cos.clamp(-1.0, 1.0))).mean().item()),
-                'proj_pos_sim_mean': float(pos_sim.mean().item()),
-                'proj_neg_sim_mean': float(neg_sim.mean().item()),
-                'target_vec_norm_mean': float(target_norm.mean().item()),
-                'positive_vec_norm_mean': float(positive_norm.mean().item()),
-                'weights_norm_mean': float(weights_anchor.norm(dim=-1).mean().item()),
-                'weights_sum_mean': float(weights_anchor.sum(dim=-1).mean().item()),
-                'weights_abs_mean': float(weights_anchor.abs().mean().item()),
+                'positive_similarity_mean': float(pos_sim.mean().item()),
+                'negative_similarity_mean': float(neg_sim.mean().item()),
+                'operator_fro_mean': float(op_fro.mean().item()),
+                'operator_row_sum_abs_mean': float(row_sum.abs().mean().item()),
             }
         return loss, stats
