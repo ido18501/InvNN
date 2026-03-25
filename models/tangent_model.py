@@ -57,17 +57,13 @@ class MLPHead(nn.Module):
 
 class TangentOperatorModel(nn.Module):
     """
-    Equivariant-contrastive operator model.
+    Learn one patch stencil W and train it through *equivariance*.
 
-    The model predicts a single scalar stencil over the patch. That stencil is the
-    object we hope will converge toward a derivative-like operator.
-
-    Training loss sees only:
-    - first-order operator output equivariance under the transformation family
-    - contrastive separation of anchor / positive / negatives in a projection space
-    - simple structural regularization on the stencil
-
-    Analytic derivatives remain diagnostics only.
+    Important:
+    - the loss should compare W(Tx) to T(Wx), not W(x) to W(Tx)
+    - the raw equivariance loss must care about magnitude, so downstream code
+      should use the full transformed vector, not cosine alone
+    - analytic derivatives remain diagnostics only
     """
 
     def __init__(
@@ -138,6 +134,14 @@ class TangentOperatorModel(nn.Module):
     def _apply_weights(weights: torch.Tensor, patch: torch.Tensor) -> torch.Tensor:
         return torch.einsum('bp,bpd->bd', weights, patch)
 
+    def project_vectors(self, vectors: torch.Tensor) -> torch.Tensor:
+        if vectors.ndim != 2 or vectors.shape[-1] != 2:
+            raise ValueError(f'Expected vectors shape (B, 2), got {tuple(vectors.shape)}')
+        projection = self.projector(vectors)
+        if self.normalize_projector:
+            projection = F.normalize(projection, dim=-1)
+        return projection
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         if x.ndim != 3 or x.shape[-1] != 2:
             raise ValueError(f'Expected input shape (B, P, 2), got {tuple(x.shape)}')
@@ -152,10 +156,7 @@ class TangentOperatorModel(nn.Module):
         vector_first = self._apply_weights(weights, x)
         weighted_patch = weights.unsqueeze(-1) * x
         vector_second = self._apply_weights(weights, weighted_patch)
-
-        projection = self.projector(vector_first)
-        if self.normalize_projector:
-            projection = F.normalize(projection, dim=-1)
+        projection = self.project_vectors(vector_first)
 
         return {
             'trunk_feature': trunk_feature,

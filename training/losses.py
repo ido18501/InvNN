@@ -7,14 +7,14 @@ import torch.nn.functional as F
 
 class EquivariantContrastiveOperatorLoss(nn.Module):
     """
-    Training loss for learning an operator through equivariance, not derivative labels.
+    Train an operator through *equivariance*, not invariance.
 
-    Ingredients:
-    - contrastive term on projected first-order outputs to separate positives from negatives
-    - raw equivariance term on the actual first-order vectors
-    - zero-sum stencil bias (derivative-like structural prior, not a label)
-    - small L2 regularization on the stencil
+    Positive pair:
+        g(T(W(x)))   <->   g(W(Tx))
+    not:
+        g(W(x))      <->   g(W(Tx))
 
+    The raw equivariance term uses full vector MSE, so magnitude matters.
     No analytic derivative enters this loss.
     """
 
@@ -26,7 +26,6 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
         lambda_eq: float = 1.0,
         lambda_sum: float = 0.1,
         lambda_reg: float = 1e-4,
-        eps: float = 1e-8,
     ) -> None:
         super().__init__()
         self.temperature = float(temperature)
@@ -34,7 +33,6 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
         self.lambda_eq = float(lambda_eq)
         self.lambda_sum = float(lambda_sum)
         self.lambda_reg = float(lambda_reg)
-        self.eps = float(eps)
 
     @staticmethod
     def _apply_linear_map(transform_matrix: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:
@@ -42,22 +40,22 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
 
     def _info_nce(
         self,
-        proj_anchor: torch.Tensor,
+        proj_anchor_equivariant: torch.Tensor,
         proj_positive: torch.Tensor,
         proj_negatives: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        proj_anchor = F.normalize(proj_anchor, dim=-1)
+        proj_anchor_equivariant = F.normalize(proj_anchor_equivariant, dim=-1)
         proj_positive = F.normalize(proj_positive, dim=-1)
         proj_negatives = F.normalize(proj_negatives, dim=-1)
 
-        pos_logits = torch.sum(proj_anchor * proj_positive, dim=-1, keepdim=True) / self.temperature
-        neg_logits = torch.einsum('bd,bmd->bm', proj_anchor, proj_negatives) / self.temperature
+        pos_logits = torch.sum(proj_anchor_equivariant * proj_positive, dim=-1, keepdim=True) / self.temperature
+        neg_logits = torch.einsum('bd,bmd->bm', proj_anchor_equivariant, proj_negatives) / self.temperature
         logits = torch.cat([pos_logits, neg_logits], dim=1)
         labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
         nce_loss = F.cross_entropy(logits, labels)
 
-        pos_sim = torch.sum(proj_anchor * proj_positive, dim=-1)
-        neg_sim = torch.mean(torch.einsum('bd,bmd->bm', proj_anchor, proj_negatives), dim=-1)
+        pos_sim = torch.sum(proj_anchor_equivariant * proj_positive, dim=-1)
+        neg_sim = torch.mean(torch.einsum('bd,bmd->bm', proj_anchor_equivariant, proj_negatives), dim=-1)
         return nce_loss, pos_sim, neg_sim
 
     def forward(
@@ -65,7 +63,7 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
         *,
         vector_anchor: torch.Tensor,
         vector_positive: torch.Tensor,
-        proj_anchor: torch.Tensor,
+        proj_anchor_equivariant: torch.Tensor,
         proj_positive: torch.Tensor,
         proj_negatives: torch.Tensor,
         weights_anchor: torch.Tensor,
@@ -73,11 +71,12 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
         return_stats: bool = False,
     ):
         target_vector = self._apply_linear_map(transform_matrix, vector_anchor)
-        eq_cos = F.cosine_similarity(vector_positive, target_vector, dim=-1)
-        eq_raw_loss = (1.0 - eq_cos).mean()
+
+        # Full equivariance: direction + magnitude.
+        eq_raw_loss = F.mse_loss(vector_positive, target_vector)
 
         nce_loss, pos_sim, neg_sim = self._info_nce(
-            proj_anchor=proj_anchor,
+            proj_anchor_equivariant=proj_anchor_equivariant,
             proj_positive=proj_positive,
             proj_negatives=proj_negatives,
         )
@@ -96,12 +95,15 @@ class EquivariantContrastiveOperatorLoss(nn.Module):
             return loss
 
         with torch.no_grad():
+            eq_cos = F.cosine_similarity(vector_positive, target_vector, dim=-1)
             target_norm = target_vector.norm(dim=-1)
             positive_norm = vector_positive.norm(dim=-1)
+            norm_mse = F.mse_loss(positive_norm, target_norm)
             stats = {
                 'loss': float(loss.item()),
                 'nce_loss': float(nce_loss.item()),
                 'eq_raw_loss': float(eq_raw_loss.item()),
+                'eq_norm_mse': float(norm_mse.item()),
                 'sum_loss': float(sum_loss.item()),
                 'reg_loss': float(reg_loss.item()),
                 'eq_cos_mean': float(eq_cos.mean().item()),

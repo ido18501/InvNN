@@ -101,25 +101,34 @@ class TangentTrainer:
             'gt_second_norm_mean': float(gt_second.norm(dim=-1).mean().item()),
         }
 
+    def _build_loss_inputs(self, batch: TangentBatch, anchor_out: dict, positive_out: dict, neg_out: dict) -> dict:
+        B, M = batch.negatives.shape[:2]
+        target_vector = torch.einsum('bij,bj->bi', batch.transform_matrix, anchor_out['vector_first'])
+
+        # Contrastive positives are equivariant positives: g(T(W(x))) vs g(W(Tx)).
+        proj_anchor_equivariant = self.model.project_vectors(target_vector)
+        proj_positive = self.model.project_vectors(positive_out['vector_first'])
+        proj_negatives = self.model.project_vectors(neg_out['vector_first']).view(B, M, -1)
+
+        return {
+            'vector_anchor': anchor_out['vector_first'],
+            'vector_positive': positive_out['vector_first'],
+            'proj_anchor_equivariant': proj_anchor_equivariant,
+            'proj_positive': proj_positive,
+            'proj_negatives': proj_negatives,
+            'weights_anchor': anchor_out['weights'],
+            'transform_matrix': batch.transform_matrix,
+        }
+
     def train_step(self, batch: TangentBatch) -> TrainOutput:
         self.model.train()
         batch = self._move_batch(batch)
         self.optimizer.zero_grad(set_to_none=True)
 
         anchor_out, positive_out, neg_out = self._forward_triplet(batch)
-        B, M = batch.negatives.shape[:2]
-        neg_proj = neg_out['projection'].view(B, M, -1)
+        loss_inputs = self._build_loss_inputs(batch, anchor_out, positive_out, neg_out)
 
-        loss, stats = self.loss_fn(
-            vector_anchor=anchor_out['vector_first'],
-            vector_positive=positive_out['vector_first'],
-            proj_anchor=anchor_out['projection'],
-            proj_positive=positive_out['projection'],
-            proj_negatives=neg_proj,
-            weights_anchor=anchor_out['weights'],
-            transform_matrix=batch.transform_matrix,
-            return_stats=True,
-        )
+        loss, stats = self.loss_fn(return_stats=True, **loss_inputs)
         loss.backward()
 
         if self.grad_clip_norm is not None:
@@ -143,19 +152,9 @@ class TangentTrainer:
         self.model.eval()
         batch = self._move_batch(batch)
         anchor_out, positive_out, neg_out = self._forward_triplet(batch)
-        B, M = batch.negatives.shape[:2]
-        neg_proj = neg_out['projection'].view(B, M, -1)
+        loss_inputs = self._build_loss_inputs(batch, anchor_out, positive_out, neg_out)
 
-        loss, stats = self.loss_fn(
-            vector_anchor=anchor_out['vector_first'],
-            vector_positive=positive_out['vector_first'],
-            proj_anchor=anchor_out['projection'],
-            proj_positive=positive_out['projection'],
-            proj_negatives=neg_proj,
-            weights_anchor=anchor_out['weights'],
-            transform_matrix=batch.transform_matrix,
-            return_stats=True,
-        )
+        loss, stats = self.loss_fn(return_stats=True, **loss_inputs)
         stats.update(
             self._derivative_metrics(
                 vector_first=anchor_out['vector_first'],
@@ -179,7 +178,11 @@ class TangentTrainer:
                 metrics[k] = metrics.get(k, 0.0) + float(v)
             n += 1
             if 'loss' in out.stats:
-                iterator.set_postfix(loss=f"{out.stats['loss']:.4f}", eq=f"{out.stats.get('eq_cos_mean', float('nan')):.3f}")
+                iterator.set_postfix(
+                    loss=f"{out.stats['loss']:.4f}",
+                    eqmse=f"{out.stats.get('eq_raw_loss', float('nan')):.4f}",
+                    eqcos=f"{out.stats.get('eq_cos_mean', float('nan')):.3f}",
+                )
         for k in list(metrics.keys()):
             metrics[k] /= max(n, 1)
         return metrics
@@ -190,7 +193,8 @@ class TangentTrainer:
             "train | "
             f"loss={train_metrics.get('loss', float('nan')):.4f} "
             f"nce={train_metrics.get('nce_loss', float('nan')):.4f} "
-            f"eq={train_metrics.get('eq_raw_loss', float('nan')):.4f} "
+            f"eqmse={train_metrics.get('eq_raw_loss', float('nan')):.6f} "
+            f"eqnorm={train_metrics.get('eq_norm_mse', float('nan')):.6f} "
             f"sum={train_metrics.get('sum_loss', float('nan')):.6f} "
             f"reg={train_metrics.get('reg_loss', float('nan')):.6f} "
             f"eqcos={train_metrics.get('eq_cos_mean', float('nan')):.4f}",
@@ -210,7 +214,8 @@ class TangentTrainer:
             "val   | "
             f"loss={val_metrics.get('loss', float('nan')):.4f} "
             f"nce={val_metrics.get('nce_loss', float('nan')):.4f} "
-            f"eq={val_metrics.get('eq_raw_loss', float('nan')):.4f} "
+            f"eqmse={val_metrics.get('eq_raw_loss', float('nan')):.6f} "
+            f"eqnorm={val_metrics.get('eq_norm_mse', float('nan')):.6f} "
             f"sum={val_metrics.get('sum_loss', float('nan')):.6f} "
             f"reg={val_metrics.get('reg_loss', float('nan')):.6f} "
             f"eqcos={val_metrics.get('eq_cos_mean', float('nan')):.4f} "
