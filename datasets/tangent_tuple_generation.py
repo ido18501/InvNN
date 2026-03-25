@@ -4,16 +4,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from utils.curve_generation import BasisExpansionCurveCoeffs
-from utils.derivatives import compute_single_anchor_fourier_arc_length_derivatives
 from utils.patch_sampling import sample_patch_around_index
-from utils.transformations import apply_transformation, sample_transformation
+from utils.transformations import sample_transformation, apply_transformation
+from utils.derivatives import compute_euclidean_arc_length_derivatives
 
 Array = np.ndarray
 
 
 @dataclass
-class InvariantTrainingTuple:
+class TangentTrainingTuple:
     family: str
     anchor_patch: Array
     positive_patch: Array
@@ -23,7 +22,6 @@ class InvariantTrainingTuple:
     negative_center_indices: Array
     gt_first_anchor: Array
     gt_second_anchor: Array
-    has_analytic_derivatives: bool
 
 
 def _sample_negative_center_indices(
@@ -34,8 +32,10 @@ def _sample_negative_center_indices(
     max_offset: int,
     closed: bool,
     rng: np.random.Generator,
+    distance_weight_power: float = 2.5,
 ) -> Array:
-    candidates = []
+    candidates: list[int] = []
+    distances: list[int] = []
     for j in range(num_points):
         if j == anchor_center_index:
             continue
@@ -44,32 +44,21 @@ def _sample_negative_center_indices(
             d = min(d, num_points - d)
         if min_offset <= d <= max_offset:
             candidates.append(j)
+            distances.append(d)
     if len(candidates) < num_negatives:
-        raise ValueError("Not enough valid negative center indices.")
-    return np.asarray(rng.choice(candidates, size=num_negatives, replace=False), dtype=np.int64)
+        raise ValueError("Not enough valid negative center indices")
+
+    candidates_arr = np.asarray(candidates, dtype=np.int64)
+    distances_arr = np.asarray(distances, dtype=np.float64)
+    # Hard negatives: prefer closer valid offsets, but still allow the whole band.
+    weights = 1.0 / np.power(np.maximum(distances_arr, 1.0), distance_weight_power)
+    weights = weights / weights.sum()
+    chosen = rng.choice(candidates_arr, size=num_negatives, replace=False, p=weights)
+    return np.asarray(chosen, dtype=np.int64)
 
 
-def _maybe_compute_derivatives(
-    coeffs: BasisExpansionCurveCoeffs | None,
-    t_grid: Array | None,
-    anchor_center_index: int,
-) -> tuple[Array, Array, bool]:
-    if coeffs is None or t_grid is None:
-        nan = np.full((2,), np.nan, dtype=np.float32)
-        return nan.copy(), nan.copy(), False
-
-    _, gt_first, gt_second = compute_single_anchor_fourier_arc_length_derivatives(
-        t_value=float(t_grid[anchor_center_index]),
-        coeffs=coeffs,
-    )
-    return gt_first.astype(np.float32), gt_second.astype(np.float32), True
-
-
-def build_invariant_training_tuple(
-    *,
+def build_tangent_training_tuple(
     curve_points: Array,
-    coeffs: BasisExpansionCurveCoeffs | None,
-    t_grid: Array | None,
     transform_family: str,
     anchor_center_index: int,
     patch_size: int,
@@ -84,11 +73,13 @@ def build_invariant_training_tuple(
     transform_kwargs: dict | None = None,
     external_negative_curves: list[Array] | None = None,
     num_cross_curve_negatives: int = 0,
-) -> InvariantTrainingTuple:
+    gt_dense_num_points: int = 4096,
+    negative_distance_weight_power: float = 2.5,
+) -> TangentTrainingTuple:
     if transform_kwargs is None:
         transform_kwargs = {}
 
-    anchor_sample = sample_patch_around_index(
+    anchor_patch = sample_patch_around_index(
         curve_points=curve_points,
         center_index=anchor_center_index,
         patch_size=patch_size,
@@ -99,12 +90,8 @@ def build_invariant_training_tuple(
         jitter_fraction=jitter_fraction,
     )
 
-    transform = sample_transformation(
-        family=transform_family,
-        rng=rng,
-        **transform_kwargs,
-    )
-    positive_patch = apply_transformation(anchor_sample.points, transform)
+    transform = sample_transformation(family=transform_family, rng=rng, **transform_kwargs)
+    positive_patch = apply_transformation(anchor_patch, transform)
 
     neg_idx = _sample_negative_center_indices(
         num_points=len(curve_points),
@@ -114,13 +101,13 @@ def build_invariant_training_tuple(
         max_offset=negative_max_offset,
         closed=closed,
         rng=rng,
+        distance_weight_power=negative_distance_weight_power,
     )
 
-    negative_patches: list[Array] = []
+    negative_patches = []
     num_in_curve = num_negatives - int(num_cross_curve_negatives)
-
     for j in neg_idx[:num_in_curve]:
-        neg_sample = sample_patch_around_index(
+        neg_patch = sample_patch_around_index(
             curve_points=curve_points,
             center_index=int(j),
             patch_size=patch_size,
@@ -130,14 +117,14 @@ def build_invariant_training_tuple(
             rng=rng,
             jitter_fraction=jitter_fraction,
         )
-        negative_patches.append(neg_sample.points.astype(np.float32))
+        negative_patches.append(neg_patch)
 
     if num_cross_curve_negatives > 0:
         if external_negative_curves is None or len(external_negative_curves) < num_cross_curve_negatives:
-            raise ValueError("external_negative_curves missing for requested cross-curve negatives.")
+            raise ValueError("external_negative_curves missing for requested cross-curve negatives")
         for ext_curve in external_negative_curves[:num_cross_curve_negatives]:
             ext_center = int(rng.integers(0, len(ext_curve)))
-            neg_sample = sample_patch_around_index(
+            neg_patch = sample_patch_around_index(
                 curve_points=ext_curve,
                 center_index=ext_center,
                 patch_size=patch_size,
@@ -147,30 +134,31 @@ def build_invariant_training_tuple(
                 rng=rng,
                 jitter_fraction=jitter_fraction,
             )
-            negative_patches.append(neg_sample.points.astype(np.float32))
+            negative_patches.append(neg_patch)
 
     negative_patches = np.stack(negative_patches, axis=0)
-    gt_first, gt_second, has_analytic = _maybe_compute_derivatives(coeffs, t_grid, anchor_center_index)
 
-    return InvariantTrainingTuple(
+    gt_first, gt_second, _ = compute_euclidean_arc_length_derivatives(
+        curve_points=curve_points,
+        anchor_index=anchor_center_index,
+        dense_num_points=gt_dense_num_points,
+    )
+
+    return TangentTrainingTuple(
         family=transform_family,
-        anchor_patch=anchor_sample.points.astype(np.float32),
+        anchor_patch=anchor_patch.astype(np.float32),
         positive_patch=positive_patch.astype(np.float32),
-        negative_patches=negative_patches,
+        negative_patches=negative_patches.astype(np.float32),
         transform_matrix=np.asarray(transform.A, dtype=np.float32),
         anchor_center_index=int(anchor_center_index),
         negative_center_indices=neg_idx.astype(np.int64),
-        gt_first_anchor=gt_first,
-        gt_second_anchor=gt_second,
-        has_analytic_derivatives=has_analytic,
+        gt_first_anchor=gt_first.astype(np.float32),
+        gt_second_anchor=gt_second.astype(np.float32),
     )
 
 
-def build_random_invariant_training_tuple(
-    *,
+def build_random_tangent_training_tuple(
     curve_points: Array,
-    coeffs: BasisExpansionCurveCoeffs | None,
-    t_grid: Array | None,
     transform_family: str,
     patch_size: int,
     half_width: int,
@@ -184,21 +172,22 @@ def build_random_invariant_training_tuple(
     transform_kwargs: dict | None = None,
     external_negative_curves: list[Array] | None = None,
     num_cross_curve_negatives: int = 0,
-) -> InvariantTrainingTuple:
+    gt_dense_num_points: int = 4096,
+    negative_distance_weight_power: float = 2.5,
+) -> TangentTrainingTuple:
     num_points = len(curve_points)
+    valid_center_margin = half_width if not closed else 0
     if closed:
         anchor_center_index = int(rng.integers(0, num_points))
     else:
-        left = half_width
-        right = num_points - half_width
+        left = valid_center_margin
+        right = num_points - valid_center_margin
         if left >= right:
-            raise ValueError("No valid center indices remain for the requested margin.")
+            raise ValueError("No valid center indices remain for the requested margin")
         anchor_center_index = int(rng.integers(left, right))
 
-    return build_invariant_training_tuple(
+    return build_tangent_training_tuple(
         curve_points=curve_points,
-        coeffs=coeffs,
-        t_grid=t_grid,
         transform_family=transform_family,
         anchor_center_index=anchor_center_index,
         patch_size=patch_size,
@@ -213,4 +202,6 @@ def build_random_invariant_training_tuple(
         transform_kwargs=transform_kwargs,
         external_negative_curves=external_negative_curves,
         num_cross_curve_negatives=num_cross_curve_negatives,
+        gt_dense_num_points=gt_dense_num_points,
+        negative_distance_weight_power=negative_distance_weight_power,
     )
