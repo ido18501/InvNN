@@ -108,13 +108,16 @@ class TangentTrainer:
 
         anchor_out, positive_out, neg_out = self._forward_triplet(batch)
         B, M = batch.negatives.shape[:2]
-        neg_emb = neg_out['embedding'].view(B, M, -1)
+        neg_proj = neg_out['projection'].view(B, M, -1)
 
         loss, stats = self.loss_fn(
-            embedding_anchor=anchor_out['embedding'],
-            embedding_positive=positive_out['embedding'],
-            embedding_negatives=neg_emb,
+            vector_anchor=anchor_out['vector_first'],
+            vector_positive=positive_out['vector_first'],
+            proj_anchor=anchor_out['projection'],
+            proj_positive=positive_out['projection'],
+            proj_negatives=neg_proj,
             weights_anchor=anchor_out['weights'],
+            transform_matrix=batch.transform_matrix,
             return_stats=True,
         )
         loss.backward()
@@ -141,13 +144,16 @@ class TangentTrainer:
         batch = self._move_batch(batch)
         anchor_out, positive_out, neg_out = self._forward_triplet(batch)
         B, M = batch.negatives.shape[:2]
-        neg_emb = neg_out['embedding'].view(B, M, -1)
+        neg_proj = neg_out['projection'].view(B, M, -1)
 
         loss, stats = self.loss_fn(
-            embedding_anchor=anchor_out['embedding'],
-            embedding_positive=positive_out['embedding'],
-            embedding_negatives=neg_emb,
+            vector_anchor=anchor_out['vector_first'],
+            vector_positive=positive_out['vector_first'],
+            proj_anchor=anchor_out['projection'],
+            proj_positive=positive_out['projection'],
+            proj_negatives=neg_proj,
             weights_anchor=anchor_out['weights'],
+            transform_matrix=batch.transform_matrix,
             return_stats=True,
         )
         stats.update(
@@ -173,7 +179,7 @@ class TangentTrainer:
                 metrics[k] = metrics.get(k, 0.0) + float(v)
             n += 1
             if 'loss' in out.stats:
-                iterator.set_postfix(loss=f"{out.stats['loss']:.4f}")
+                iterator.set_postfix(loss=f"{out.stats['loss']:.4f}", eq=f"{out.stats.get('eq_cos_mean', float('nan')):.3f}")
         for k in list(metrics.keys()):
             metrics[k] /= max(n, 1)
         return metrics
@@ -183,11 +189,11 @@ class TangentTrainer:
         print(
             "train | "
             f"loss={train_metrics.get('loss', float('nan')):.4f} "
-            f"inv={train_metrics.get('inv_loss', float('nan')):.4f} "
-            f"var={train_metrics.get('var_loss', float('nan')):.4f} "
-            f"cov={train_metrics.get('cov_loss', float('nan')):.4f} "
-            f"neg={train_metrics.get('neg_loss', float('nan')):.4f} "
-            f"reg={train_metrics.get('reg_loss', float('nan')):.6f}",
+            f"nce={train_metrics.get('nce_loss', float('nan')):.4f} "
+            f"eq={train_metrics.get('eq_raw_loss', float('nan')):.4f} "
+            f"sum={train_metrics.get('sum_loss', float('nan')):.6f} "
+            f"reg={train_metrics.get('reg_loss', float('nan')):.6f} "
+            f"eqcos={train_metrics.get('eq_cos_mean', float('nan')):.4f}",
             flush=True,
         )
         print(
@@ -203,11 +209,12 @@ class TangentTrainer:
         print(
             "val   | "
             f"loss={val_metrics.get('loss', float('nan')):.4f} "
-            f"inv={val_metrics.get('inv_loss', float('nan')):.4f} "
-            f"var={val_metrics.get('var_loss', float('nan')):.4f} "
-            f"cov={val_metrics.get('cov_loss', float('nan')):.4f} "
-            f"neg={val_metrics.get('neg_loss', float('nan')):.4f} "
-            f"reg={val_metrics.get('reg_loss', float('nan')):.6f}",
+            f"nce={val_metrics.get('nce_loss', float('nan')):.4f} "
+            f"eq={val_metrics.get('eq_raw_loss', float('nan')):.4f} "
+            f"sum={val_metrics.get('sum_loss', float('nan')):.6f} "
+            f"reg={val_metrics.get('reg_loss', float('nan')):.6f} "
+            f"eqcos={val_metrics.get('eq_cos_mean', float('nan')):.4f} "
+            f"analytic={val_metrics.get('analytic_fraction', float('nan')):.2f}",
             flush=True,
         )
         print(
@@ -217,8 +224,7 @@ class TangentTrainer:
             f"ang1={val_metrics.get('first_angle_deg_mean', float('nan')):.2f}° "
             f"ang2={val_metrics.get('second_angle_deg_mean', float('nan')):.2f}° "
             f"mse1={val_metrics.get('first_mse', float('nan')):.6f} "
-            f"mse2={val_metrics.get('second_mse', float('nan')):.6f} "
-            f"analytic={val_metrics.get('analytic_fraction', float('nan')):.2f}",
+            f"mse2={val_metrics.get('second_mse', float('nan')):.6f}",
             flush=True,
         )
 

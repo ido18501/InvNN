@@ -9,14 +9,12 @@ from torch.utils.data import DataLoader
 from datasets.tangent_dataset import TangentDataset
 from models.tangent_model import TangentOperatorModel
 from training.collate import tangent_collate_fn
-from training.losses import InvariantOperatorLoss
+from training.losses import EquivariantContrastiveOperatorLoss
 from training.trainer import TangentTrainer
-
 
 
 def parse_int_list(s: str) -> list[int]:
     return [int(x) for x in s.split(',') if x.strip()]
-
 
 
 def parse_args():
@@ -33,11 +31,11 @@ def parse_args():
     p.add_argument('--half-width', type=int, default=12)
     p.add_argument('--num-negatives', type=int, default=8)
     p.add_argument('--point-mlp-dims', type=str, default='64,64,128')
-    p.add_argument('--projector-dims', type=str, default='128')
+    p.add_argument('--trunk-dims', type=str, default='128')
     p.add_argument('--head-dims', type=str, default='128,64')
-    p.add_argument('--invariant-dim', type=int, default=64)
+    p.add_argument('--projector-dims', type=str, default='64,64')
+    p.add_argument('--projector-out-dim', type=int, default=64)
     return p.parse_args()
-
 
 
 def main():
@@ -64,9 +62,10 @@ def main():
     model = TangentOperatorModel(
         patch_size=args.patch_size,
         point_mlp_dims=parse_int_list(args.point_mlp_dims),
-        projector_dims=parse_int_list(args.projector_dims),
+        trunk_dims=parse_int_list(args.trunk_dims),
         head_dims=parse_int_list(args.head_dims),
-        invariant_dim=args.invariant_dim,
+        projector_dims=parse_int_list(args.projector_dims),
+        projector_out_dim=args.projector_out_dim,
     )
     ckpt = torch.load(Path(args.checkpoint), map_location=args.device)
     model.load_state_dict(ckpt)
@@ -74,7 +73,7 @@ def main():
     trainer = TangentTrainer(
         model=model,
         optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
-        loss_fn=InvariantOperatorLoss(),
+        loss_fn=EquivariantContrastiveOperatorLoss(),
         device=args.device,
         checkpoint_dir=Path(args.checkpoint).parent,
     )

@@ -57,16 +57,17 @@ class MLPHead(nn.Module):
 
 class TangentOperatorModel(nn.Module):
     """
-    Invariant-first model.
+    Equivariant-contrastive operator model.
 
-    - encode patch points
-    - pool to patch descriptor
-    - produce invariant code z
-    - predict one scalar stencil W from z
-    - apply W once and twice to centered patch coordinates
+    The model predicts a single scalar stencil over the patch. That stencil is the
+    object we hope will converge toward a derivative-like operator.
 
-    The loss only acts on invariant embeddings and on regularity of the learned code.
-    Derivative comparison is external diagnostics only.
+    Training loss sees only:
+    - first-order operator output equivariance under the transformation family
+    - contrastive separation of anchor / positive / negatives in a projection space
+    - simple structural regularization on the stencil
+
+    Analytic derivatives remain diagnostics only.
     """
 
     def __init__(
@@ -74,26 +75,29 @@ class TangentOperatorModel(nn.Module):
         patch_size: int,
         point_dim: int = 2,
         point_mlp_dims: list[int] | None = None,
-        projector_dims: list[int] | None = None,
+        trunk_dims: list[int] | None = None,
         head_dims: list[int] | None = None,
-        invariant_dim: int = 64,
+        projector_dims: list[int] | None = None,
+        projector_out_dim: int = 64,
         use_batchnorm: bool = True,
         point_dropout: float = 0.0,
         head_dropout: float = 0.0,
-        normalize_embedding: bool = True,
+        normalize_projector: bool = True,
         center_weights: bool = True,
     ) -> None:
         super().__init__()
         if point_mlp_dims is None:
             point_mlp_dims = [64, 64, 128]
-        if projector_dims is None:
-            projector_dims = [128]
+        if trunk_dims is None:
+            trunk_dims = [128]
         if head_dims is None:
             head_dims = [128, 64]
+        if projector_dims is None:
+            projector_dims = [64, 64]
 
-        self.patch_size = patch_size
-        self.normalize_embedding = normalize_embedding
-        self.center_weights = center_weights
+        self.patch_size = int(patch_size)
+        self.normalize_projector = bool(normalize_projector)
+        self.center_weights = bool(center_weights)
 
         self.point_encoder = SharedMLP(
             in_dim=point_dim,
@@ -104,46 +108,60 @@ class TangentOperatorModel(nn.Module):
         feature_dim = point_mlp_dims[-1]
         pooled_dim = 2 * feature_dim
 
-        self.projector = MLPHead(
+        self.trunk = MLPHead(
             in_dim=pooled_dim,
-            hidden_dims=projector_dims,
-            out_dim=invariant_dim,
+            hidden_dims=trunk_dims,
+            out_dim=trunk_dims[-1],
             dropout=head_dropout,
         )
+        trunk_dim = trunk_dims[-1]
         self.operator_head = MLPHead(
-            in_dim=invariant_dim,
+            in_dim=trunk_dim,
             hidden_dims=head_dims,
-            out_dim=patch_size,
+            out_dim=self.patch_size,
             dropout=head_dropout,
         )
+        self.projector = MLPHead(
+            in_dim=2,
+            hidden_dims=projector_dims,
+            out_dim=projector_out_dim,
+            dropout=head_dropout,
+        )
+
+    def _pool_patch(self, x: torch.Tensor) -> torch.Tensor:
+        point_features = self.point_encoder(x)
+        mean_feat = point_features.mean(dim=1)
+        max_feat = point_features.max(dim=1).values
+        return torch.cat([mean_feat, max_feat], dim=-1)
+
+    @staticmethod
+    def _apply_weights(weights: torch.Tensor, patch: torch.Tensor) -> torch.Tensor:
+        return torch.einsum('bp,bpd->bd', weights, patch)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         if x.ndim != 3 or x.shape[-1] != 2:
             raise ValueError(f'Expected input shape (B, P, 2), got {tuple(x.shape)}')
 
-        point_features = self.point_encoder(x)
-        mean_feat = point_features.mean(dim=1)
-        max_feat = point_features.max(dim=1).values
-        patch_feature = torch.cat([mean_feat, max_feat], dim=-1)
+        pooled = self._pool_patch(x)
+        trunk_feature = self.trunk(pooled)
 
-        invariant_code = self.projector(patch_feature)
-        embedding = F.normalize(invariant_code, dim=-1) if self.normalize_embedding else invariant_code
-
-        weights = self.operator_head(invariant_code)
+        weights = self.operator_head(trunk_feature)
         if self.center_weights:
             weights = weights - weights.mean(dim=-1, keepdim=True)
 
-        vector_first = torch.einsum('bp,bpd->bd', weights, x)
+        vector_first = self._apply_weights(weights, x)
         weighted_patch = weights.unsqueeze(-1) * x
-        vector_second = torch.einsum('bp,bpd->bd', weights, weighted_patch)
+        vector_second = self._apply_weights(weights, weighted_patch)
+
+        projection = self.projector(vector_first)
+        if self.normalize_projector:
+            projection = F.normalize(projection, dim=-1)
 
         return {
-            'embedding': embedding,
-            'invariant_code': invariant_code,
+            'trunk_feature': trunk_feature,
             'weights': weights,
-            'weights_first': weights,
-            'weights_second': weights,
             'vector': vector_first,
             'vector_first': vector_first,
             'vector_second': vector_second,
+            'projection': projection,
         }

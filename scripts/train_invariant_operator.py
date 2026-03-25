@@ -10,21 +10,18 @@ from torch.utils.data import DataLoader
 from datasets.tangent_dataset import TangentDataset
 from models.tangent_model import TangentOperatorModel
 from training.collate import tangent_collate_fn
-from training.losses import InvariantOperatorLoss
+from training.losses import EquivariantContrastiveOperatorLoss
 from training.trainer import TangentTrainer
-
 
 
 def parse_int_list(s: str) -> list[int]:
     return [int(x) for x in s.split(',') if x.strip()]
 
 
-
 def add_dataset_args(p: argparse.ArgumentParser, prefix: str):
     p.add_argument(f'--{prefix}-source', type=str, default='generated', choices=['generated', 'pregenerated'])
     p.add_argument(f'--{prefix}-bank', type=str, default=None)
     p.add_argument(f'--{prefix}-length', type=int, default=4096)
-
 
 
 def parse_args():
@@ -61,25 +58,23 @@ def parse_args():
     p.add_argument('--fourier-decay-power', type=float, default=2.0)
 
     p.add_argument('--point-mlp-dims', type=str, default='64,64,128')
-    p.add_argument('--projector-dims', type=str, default='128')
+    p.add_argument('--trunk-dims', type=str, default='128')
     p.add_argument('--head-dims', type=str, default='128,64')
-    p.add_argument('--invariant-dim', type=int, default=64)
+    p.add_argument('--projector-dims', type=str, default='64,64')
+    p.add_argument('--projector-out-dim', type=int, default=64)
     p.add_argument('--point-dropout', type=float, default=0.0)
     p.add_argument('--head-dropout', type=float, default=0.0)
     p.add_argument('--disable-batchnorm', action='store_true')
-    p.add_argument('--disable-normalize-embedding', action='store_true')
+    p.add_argument('--disable-normalize-projector', action='store_true')
     p.add_argument('--disable-center-weights', action='store_true')
 
-    p.add_argument('--lambda-inv', type=float, default=25.0)
-    p.add_argument('--lambda-var', type=float, default=25.0)
-    p.add_argument('--lambda-cov', type=float, default=1.0)
-    p.add_argument('--lambda-neg', type=float, default=1.0)
+    p.add_argument('--temperature', type=float, default=0.1)
+    p.add_argument('--lambda-nce', type=float, default=1.0)
+    p.add_argument('--lambda-eq', type=float, default=1.0)
+    p.add_argument('--lambda-sum', type=float, default=0.1)
     p.add_argument('--lambda-reg', type=float, default=1e-4)
-    p.add_argument('--variance-target', type=float, default=1.0)
-    p.add_argument('--negative-margin', type=float, default=0.25)
 
     return p.parse_args()
-
 
 
 def make_dataset(args, split: str) -> TangentDataset:
@@ -107,7 +102,6 @@ def make_dataset(args, split: str) -> TangentDataset:
         warp_sampling_strength=args.warp_sampling_strength,
         seed=args.seed + {'train': 0, 'val': 10000, 'test': 20000}[split],
     )
-
 
 
 def main():
@@ -153,24 +147,23 @@ def main():
     model = TangentOperatorModel(
         patch_size=args.patch_size,
         point_mlp_dims=parse_int_list(args.point_mlp_dims),
-        projector_dims=parse_int_list(args.projector_dims),
+        trunk_dims=parse_int_list(args.trunk_dims),
         head_dims=parse_int_list(args.head_dims),
-        invariant_dim=args.invariant_dim,
+        projector_dims=parse_int_list(args.projector_dims),
+        projector_out_dim=args.projector_out_dim,
         use_batchnorm=not args.disable_batchnorm,
         point_dropout=args.point_dropout,
         head_dropout=args.head_dropout,
-        normalize_embedding=not args.disable_normalize_embedding,
+        normalize_projector=not args.disable_normalize_projector,
         center_weights=not args.disable_center_weights,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = InvariantOperatorLoss(
-        lambda_inv=args.lambda_inv,
-        lambda_var=args.lambda_var,
-        lambda_cov=args.lambda_cov,
-        lambda_neg=args.lambda_neg,
+    loss_fn = EquivariantContrastiveOperatorLoss(
+        temperature=args.temperature,
+        lambda_nce=args.lambda_nce,
+        lambda_eq=args.lambda_eq,
+        lambda_sum=args.lambda_sum,
         lambda_reg=args.lambda_reg,
-        variance_target=args.variance_target,
-        negative_margin=args.negative_margin,
     )
 
     trainer = TangentTrainer(

@@ -117,3 +117,8 @@ python scripts/evaluate_checkpoint.py \
 - Progress bars are shown live with `tqdm` during train / val / test.
 - Epoch summaries print both the training loss terms and the derivative-emergence metrics.
 - If derivative labels are unavailable, the trainer will skip those diagnostics safely.
+
+
+## Current training objective
+
+This project now trains the operator with an equivariant-contrastive objective, not an invariant embedding loss. The loss uses only: InfoNCE on projected first-order outputs, raw first-order equivariance, zero-sum stencil bias, and small L2 regularization. Analytic first and second derivatives are logged for monitoring only and never used as labels during optimization.
