@@ -71,6 +71,46 @@ def _compute_gt_arc_length_derivatives(
     except Exception:
         pass
 
+    def _compute_anchor_derivatives_with_optional_analytic(
+            curve_points: Array,
+            anchor_index: int,
+            *,
+            coeffs=None,
+            t_grid: Array | None = None,
+            dense_num_points: int = 4096,
+    ) -> tuple[Array, Array, bool]:
+        """
+        Backward-compatible derivative helper.
+
+        If Fourier coeffs + anchor parameter value are available, use exact analytic
+        Euclidean arc-length derivatives. Otherwise fall back to the current dense
+        geometric estimate.
+        """
+        if coeffs is not None and t_grid is not None:
+            try:
+                from utils.derivatives import compute_single_anchor_fourier_arc_length_derivatives
+
+                t_grid = np.asarray(t_grid, dtype=np.float64)
+                if t_grid.ndim == 1 and 0 <= anchor_index < len(t_grid):
+                    _, first, second = compute_single_anchor_fourier_arc_length_derivatives(
+                        t_value=float(t_grid[anchor_index]),
+                        coeffs=coeffs,
+                    )
+                    return (
+                        np.asarray(first, dtype=np.float64),
+                        np.asarray(second, dtype=np.float64),
+                        True,
+                    )
+            except Exception:
+                pass
+
+        first, second, _ = _compute_gt_arc_length_derivatives(
+            curve_points=curve_points,
+            anchor_index=anchor_index,
+            dense_num_points=dense_num_points,
+        )
+        return first, second, False
+
     curve_points = np.asarray(curve_points, dtype=np.float64)
     dense = _resample_closed_curve_uniform_arc_length(curve_points, num_points=dense_num_points)
     q = curve_points[anchor_index]
@@ -174,6 +214,7 @@ class TangentTrainingTuple:
     negative_center_indices: Array
     gt_first_anchor: Array
     gt_second_anchor: Array
+    has_analytic_derivatives: bool = False
 
 
 def _collect_band_candidates(
@@ -403,6 +444,8 @@ def build_tangent_training_tuple(
     external_negative_curves: list[Array] | None = None,
     num_cross_curve_negatives: int = 0,
     gt_dense_num_points: int = 4096,
+    coeffs=None,
+    t_grid: Array | None = None,
 ) -> TangentTrainingTuple:
     if transform_kwargs is None:
         transform_kwargs = {}
@@ -487,9 +530,11 @@ def build_tangent_training_tuple(
 
     negative_patches = np.stack(negative_patches, axis=0)
 
-    gt_first, gt_second, _ = _compute_gt_arc_length_derivatives(
+    gt_first, gt_second, has_analytic_derivatives = _compute_anchor_derivatives_with_optional_analytic(
         curve_points=curve_points,
         anchor_index=anchor_center_index,
+        coeffs=coeffs,
+        t_grid=t_grid,
         dense_num_points=gt_dense_num_points,
     )
 
@@ -503,8 +548,8 @@ def build_tangent_training_tuple(
         negative_center_indices=neg_idx.astype(np.int64),
         gt_first_anchor=gt_first.astype(np.float32),
         gt_second_anchor=gt_second.astype(np.float32),
+        has_analytic_derivatives=has_analytic_derivatives,
     )
-
 
 def build_random_tangent_training_tuple(
     curve_points: Array,
@@ -522,6 +567,8 @@ def build_random_tangent_training_tuple(
     external_negative_curves: list[Array] | None = None,
     num_cross_curve_negatives: int = 0,
     gt_dense_num_points: int = 4096,
+    coeffs=None,
+    t_grid: Array | None = None,
 ) -> TangentTrainingTuple:
     num_points = len(curve_points)
     valid_center_margin = half_width if not closed else 0
@@ -552,4 +599,52 @@ def build_random_tangent_training_tuple(
         external_negative_curves=external_negative_curves,
         num_cross_curve_negatives=num_cross_curve_negatives,
         gt_dense_num_points=gt_dense_num_points,
+        coeffs=coeffs,
+        t_grid=t_grid,
+    )
+
+def build_random_invariant_training_tuple(
+    curve_points: Array,
+    coeffs=None,
+    t_grid: Array | None = None,
+    transform_family: str = "euclidean",
+    patch_size: int = 9,
+    half_width: int = 12,
+    num_negatives: int = 8,
+    negative_min_offset: int = 5,
+    negative_max_offset: int = 25,
+    closed: bool = True,
+    patch_mode: str = "random_warp_symmetric",
+    jitter_fraction: float = 0.25,
+    rng: np.random.Generator | None = None,
+    transform_kwargs: dict | None = None,
+    external_negative_curves: list[Array] | None = None,
+    num_cross_curve_negatives: int = 0,
+    gt_dense_num_points: int = 4096,
+) -> TangentTrainingTuple:
+    """
+    Backward-compatible entry point expected by datasets/tangent_dataset.py.
+    Keeps the new tuple generation logic intact and only adapts the interface.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    return build_random_tangent_training_tuple(
+        curve_points=curve_points,
+        transform_family=transform_family,
+        patch_size=patch_size,
+        half_width=half_width,
+        num_negatives=num_negatives,
+        negative_min_offset=negative_min_offset,
+        negative_max_offset=negative_max_offset,
+        closed=closed,
+        patch_mode=patch_mode,
+        jitter_fraction=jitter_fraction,
+        rng=rng,
+        transform_kwargs=transform_kwargs,
+        external_negative_curves=external_negative_curves,
+        num_cross_curve_negatives=num_cross_curve_negatives,
+        gt_dense_num_points=gt_dense_num_points,
+        coeffs=coeffs,
+        t_grid=t_grid,
     )
