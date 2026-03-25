@@ -1,0 +1,12 @@
+{
+  "num_curves": 500,
+  "num_points": 1000,
+  "max_freq": 16,
+  "scale": 1.0,
+  "decay_power": 1.55,
+  "min_size": 0.18,
+  "max_size": 1.8,
+  "max_tries": 200,
+  "intersection_check_points": 512,
+  "seed": 124
+}
