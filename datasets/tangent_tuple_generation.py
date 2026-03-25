@@ -71,45 +71,7 @@ def _compute_gt_arc_length_derivatives(
     except Exception:
         pass
 
-    def _compute_anchor_derivatives_with_optional_analytic(
-            curve_points: Array,
-            anchor_index: int,
-            *,
-            coeffs=None,
-            t_grid: Array | None = None,
-            dense_num_points: int = 4096,
-    ) -> tuple[Array, Array, bool]:
-        """
-        Backward-compatible derivative helper.
 
-        If Fourier coeffs + anchor parameter value are available, use exact analytic
-        Euclidean arc-length derivatives. Otherwise fall back to the current dense
-        geometric estimate.
-        """
-        if coeffs is not None and t_grid is not None:
-            try:
-                from utils.derivatives import compute_single_anchor_fourier_arc_length_derivatives
-
-                t_grid = np.asarray(t_grid, dtype=np.float64)
-                if t_grid.ndim == 1 and 0 <= anchor_index < len(t_grid):
-                    _, first, second = compute_single_anchor_fourier_arc_length_derivatives(
-                        t_value=float(t_grid[anchor_index]),
-                        coeffs=coeffs,
-                    )
-                    return (
-                        np.asarray(first, dtype=np.float64),
-                        np.asarray(second, dtype=np.float64),
-                        True,
-                    )
-            except Exception:
-                pass
-
-        first, second, _ = _compute_gt_arc_length_derivatives(
-            curve_points=curve_points,
-            anchor_index=anchor_index,
-            dense_num_points=dense_num_points,
-        )
-        return first, second, False
 
     curve_points = np.asarray(curve_points, dtype=np.float64)
     dense = _resample_closed_curve_uniform_arc_length(curve_points, num_points=dense_num_points)
@@ -426,6 +388,46 @@ def _sample_negative_center_indices(
 
     return np.asarray(chosen[:num_negatives], dtype=np.int64)
 
+
+def _compute_anchor_derivatives_with_optional_analytic(
+        curve_points: Array,
+        anchor_index: int,
+        *,
+        coeffs=None,
+        t_grid: Array | None = None,
+        dense_num_points: int = 4096,
+) -> tuple[Array, Array, bool]:
+    """
+    Backward-compatible derivative helper.
+
+    If Fourier coeffs + anchor parameter value are available, use exact analytic
+    Euclidean arc-length derivatives. Otherwise fall back to the current dense
+    geometric estimate.
+    """
+    if coeffs is not None and t_grid is not None:
+        try:
+            from utils.derivatives import compute_single_anchor_fourier_arc_length_derivatives
+
+            t_grid = np.asarray(t_grid, dtype=np.float64)
+            if t_grid.ndim == 1 and 0 <= anchor_index < len(t_grid):
+                _, first, second = compute_single_anchor_fourier_arc_length_derivatives(
+                    t_value=float(t_grid[anchor_index]),
+                    coeffs=coeffs,
+                )
+                return (
+                    np.asarray(first, dtype=np.float64),
+                    np.asarray(second, dtype=np.float64),
+                    True,
+                )
+        except Exception:
+            pass
+
+    first, second, _ = _compute_gt_arc_length_derivatives(
+        curve_points=curve_points,
+        anchor_index=anchor_index,
+        dense_num_points=dense_num_points,
+    )
+    return first, second, False
 
 def build_tangent_training_tuple(
     curve_points: Array,
