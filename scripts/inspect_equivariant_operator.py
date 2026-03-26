@@ -1,0 +1,247 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+from models.tangent_model import TangentOperatorModel
+
+
+def parse_hidden_dims(s: str):
+    return [int(x) for x in s.split(",") if x.strip()]
+
+
+def load_model(args):
+    model = TangentOperatorModel(
+        patch_size=args.patch_size,
+        operator_hidden_dims=parse_hidden_dims(args.operator_hidden_dims),
+        signature_hidden_dims=parse_hidden_dims(args.signature_hidden_dims),
+        operator_bandwidth=args.operator_bandwidth,
+        signature_center_radius=args.signature_center_radius,
+    ).to(args.device)
+
+    ckpt = torch.load(args.checkpoint, map_location=args.device)
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+def find_curve_array(npz):
+    for key in ["curves", "curve_points", "points"]:
+        if key in npz and npz[key].ndim == 3 and npz[key].shape[-1] == 2:
+            return npz[key]
+    for key in npz.files:
+        arr = npz[key]
+        if isinstance(arr, np.ndarray) and arr.ndim == 3 and arr.shape[-1] == 2:
+            return arr
+    raise RuntimeError("Could not find curve array in bank")
+
+
+def sample_patch(curve: np.ndarray, patch_size: int, half_width: int):
+    n = curve.shape[0]
+    c = random.randint(half_width, n - half_width - 1)
+    idx = np.linspace(c - half_width, c + half_width, patch_size)
+    idx = np.round(idx).astype(int)
+    idx = np.clip(idx, 0, n - 1)
+    return curve[idx], idx, c
+
+
+def random_euclidean_transform():
+    theta = random.uniform(-math.pi, math.pi)
+    c, s = math.cos(theta), math.sin(theta)
+    A = np.array([[c, -s], [s, c]], dtype=np.float32)
+    b = np.random.uniform(-0.4, 0.4, size=(2,)).astype(np.float32)
+    return A, b, theta
+
+
+def apply_transform_points(x: np.ndarray, A: np.ndarray, b: np.ndarray):
+    return x @ A.T + b[None, :]
+
+
+def apply_transform_vectors(v: np.ndarray, A: np.ndarray):
+    return v @ A.T
+
+
+def cosine(a, b, eps=1e-12):
+    an = np.linalg.norm(a)
+    bn = np.linalg.norm(b)
+    if an < eps or bn < eps:
+        return float("nan")
+    return float(np.dot(a, b) / (an * bn))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--bank", required=True)
+    p.add_argument("--outdir", required=True)
+    p.add_argument("--patch-size", type=int, default=9)
+    p.add_argument("--half-width", type=int, default=12)
+    p.add_argument("--num-samples", type=int, default=8)
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--operator-hidden-dims", default="256,256")
+    p.add_argument("--signature-hidden-dims", default="128,64")
+    p.add_argument("--operator-bandwidth", type=int, default=2)
+    p.add_argument("--signature-center-radius", type=int, default=1)
+    args = p.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    model = load_model(args)
+    bank = np.load(args.bank, allow_pickle=True)
+    curves = find_curve_array(bank)
+
+    chosen = np.random.choice(len(curves), size=min(args.num_samples, len(curves)), replace=False)
+    stats_all = []
+
+    for i, ci in enumerate(chosen):
+        curve = np.asarray(curves[ci], dtype=np.float32)
+        patch, idx, center_idx = sample_patch(curve, args.patch_size, args.half_width)
+
+        A, b, theta = random_euclidean_transform()
+        curve_t = apply_transform_points(curve, A, b)
+        patch_t = curve_t[idx]
+
+        with torch.no_grad():
+            xa = torch.from_numpy(patch[None]).to(args.device)
+            xp = torch.from_numpy(patch_t[None]).to(args.device)
+
+            out_a = model(xa)
+            out_p = model(xp)
+
+        # get operator key
+        if "operator" in out_a:
+            W_a_t = out_a["operator"][0]
+        elif "W" in out_a:
+            W_a_t = out_a["W"][0]
+        else:
+            raise KeyError(f"Could not find operator key in model output. Keys: {list(out_a.keys())}")
+
+        if "operator" in out_p:
+            W_p_t = out_p["operator"][0]
+        elif "W" in out_p:
+            W_p_t = out_p["W"][0]
+        else:
+            raise KeyError(f"Could not find operator key in model output. Keys: {list(out_p.keys())}")
+
+        # compute Y1,Y2 manually
+        X_a_t = xa[0]
+        X_p_t = xp[0]
+
+        Y1_a_t = W_a_t @ X_a_t
+        Y2_a_t = W_a_t @ Y1_a_t
+
+        Y1_p_t = W_p_t @ X_p_t
+        Y2_p_t = W_p_t @ Y1_p_t
+
+        W = W_a_t.detach().cpu().numpy()
+        Y1 = Y1_a_t.detach().cpu().numpy()
+        Y2 = Y2_a_t.detach().cpu().numpy()
+        Y1p = Y1_p_t.detach().cpu().numpy()
+        Y2p = Y2_p_t.detach().cpu().numpy()
+
+        Y1_expected = apply_transform_vectors(Y1, A)
+        Y2_expected = apply_transform_vectors(Y2, A)
+
+        center = args.patch_size // 2
+        eq_mse = float(np.mean((Y1p - Y1_expected) ** 2))
+        eq_cos = cosine(Y1p[center], Y1_expected[center])
+        eq2_mse = float(np.mean((Y2p - Y2_expected) ** 2))
+        eq2_cos = cosine(Y2p[center], Y2_expected[center])
+
+        row_sums = W.sum(axis=1)
+        svals = np.linalg.svd(W, compute_uv=False)
+        eigvals = np.linalg.eigvals(W)
+
+        fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+
+        ax = axes[0, 0]
+        ax.plot(curve[:, 0], curve[:, 1], lw=1)
+        ax.scatter(patch[:, 0], patch[:, 1], c=np.arange(len(patch)), s=30)
+        ax.scatter(patch[center, 0], patch[center, 1], c="red", s=70, marker="x")
+        ax.set_title("original curve + patch")
+        ax.axis("equal")
+
+        ax = axes[0, 1]
+        ax.plot(curve_t[:, 0], curve_t[:, 1], lw=1)
+        ax.scatter(patch_t[:, 0], patch_t[:, 1], c=np.arange(len(patch_t)), s=30)
+        ax.scatter(patch_t[center, 0], patch_t[center, 1], c="red", s=70, marker="x")
+        ax.set_title(f"transformed curve + patch\nθ={theta:.2f}")
+        ax.axis("equal")
+
+        ax = axes[0, 2]
+        im = ax.imshow(W, aspect="auto")
+        ax.set_title("predicted W(x)")
+        fig.colorbar(im, ax=ax, fraction=0.046)
+
+        ax = axes[0, 3]
+        ax.plot(row_sums, marker="o", label="row sums")
+        ax.plot(svals, marker="x", label="singular values")
+        ax.legend()
+        ax.set_title("row sums + singular values")
+
+        ax = axes[1, 0]
+        ax.scatter(patch[:, 0], patch[:, 1], s=30)
+        ax.quiver(patch[:, 0], patch[:, 1], Y1[:, 0], Y1[:, 1], angles="xy", scale_units="xy", scale=1.0)
+        ax.set_title("Y1 = W(x)X")
+        ax.axis("equal")
+
+        ax = axes[1, 1]
+        ax.scatter(patch_t[:, 0], patch_t[:, 1], s=30)
+        ax.quiver(patch_t[:, 0], patch_t[:, 1], Y1p[:, 0], Y1p[:, 1], angles="xy", scale_units="xy", scale=1.0, label="pred")
+        ax.quiver(patch_t[:, 0], patch_t[:, 1], Y1_expected[:, 0], Y1_expected[:, 1], angles="xy", scale_units="xy", scale=1.0, alpha=0.45, label="expected")
+        ax.legend()
+        ax.set_title(f"equivariance on Y1\nMSE={eq_mse:.3e}")
+        ax.axis("equal")
+
+        ax = axes[1, 2]
+        ax.scatter(patch[:, 0], patch[:, 1], s=30)
+        ax.quiver(patch[:, 0], patch[:, 1], Y2[:, 0], Y2[:, 1], angles="xy", scale_units="xy", scale=1.0)
+        ax.set_title("Y2 = W(x)Y1")
+        ax.axis("equal")
+
+        ax = axes[1, 3]
+        ax.plot(np.real(eigvals), np.imag(eigvals), "o")
+        ax.axhline(0, lw=1)
+        ax.axvline(0, lw=1)
+        ax.set_title(f"spectrum\ncenter eq cos Y1={eq_cos:.4f}, Y2={eq2_cos:.4f}")
+
+        fig.tight_layout()
+        fig.savefig(outdir / f"sample_{i:02d}_curve_{ci}.png", dpi=160)
+        plt.close(fig)
+
+        stats_all.append({
+            "sample_rank": int(i),
+            "curve_index": int(ci),
+            "center_index": int(center_idx),
+            "eq_mse_y1": eq_mse,
+            "eq_cos_center_y1": eq_cos,
+            "eq_mse_y2": eq2_mse,
+            "eq_cos_center_y2": eq2_cos,
+            "operator_fro": float(np.linalg.norm(W)),
+            "operator_row_sum_l2": float(np.linalg.norm(row_sums)),
+            "operator_spec_radius": float(np.max(np.abs(eigvals))),
+            "operator_sval_max": float(np.max(svals)),
+        })
+
+    with open(outdir / "per_sample_stats.json", "w") as f:
+        json.dump(stats_all, f, indent=2)
+
+    print(f"saved outputs to {outdir}")
+
+
+if __name__ == "__main__":
+    main()
