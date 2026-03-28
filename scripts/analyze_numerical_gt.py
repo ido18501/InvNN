@@ -128,6 +128,14 @@ def flatten_cos(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     b_flat = b.reshape(b.shape[0], -1)
     return F.cosine_similarity(a_flat, b_flat, dim=-1)
 
+def apply_linear_map_to_vecs(T: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    T: (B,2,2)
+    v: (B,2)
+    returns: (B,2)
+    """
+    return torch.einsum("bij,bj->bi", T, v)
+
 
 def frame_residual_angles_deg(pred: torch.Tensor, gt_dir: torch.Tensor) -> np.ndarray:
     pred_u = pred / (pred.norm(dim=-1, keepdim=True) + 1e-12)
@@ -407,6 +415,69 @@ def plot_patch_with_field(ax, pts: np.ndarray, field: np.ndarray, title: str):
     ax.set_title(title)
     ax.axis("equal")
 
+def get_patch_center_point(pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float64)
+    return pts[len(pts) // 2]
+
+
+def draw_center_vector(ax, center: np.ndarray, vec: np.ndarray, color: str, label: str, scale: float = 1.0, lw: float = 2.0):
+    vec = np.asarray(vec, dtype=np.float64)
+    center = np.asarray(center, dtype=np.float64)
+    ax.arrow(
+        center[0], center[1],
+        scale * vec[0], scale * vec[1],
+        color=color,
+        width=0.0,
+        head_width=0.0,
+        length_includes_head=True,
+        linewidth=lw,
+        label=label,
+    )
+
+
+def robust_vector_scale(pred: np.ndarray, gt: np.ndarray, pts: np.ndarray, frac: float = 0.35) -> float:
+    """
+    Choose a visualization scale so overlaid center vectors are visible
+    relative to the patch size, while preserving direction.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
+    gt = np.asarray(gt, dtype=np.float64)
+
+    mins = pts.min(axis=0)
+    maxs = pts.max(axis=0)
+    patch_extent = float(np.linalg.norm(maxs - mins))
+    patch_extent = max(patch_extent, 1e-8)
+
+    ref = max(float(np.linalg.norm(pred)), float(np.linalg.norm(gt)), 1e-8)
+    return frac * patch_extent / ref
+
+
+def plot_patch_with_center_derivative_overlay(
+    ax,
+    pts: np.ndarray,
+    pred_vec: np.ndarray,
+    gt_vec: np.ndarray,
+    title: str,
+    show_neg_gt: bool = False,
+):
+    pts = np.asarray(pts, dtype=np.float64)
+    pred_vec = np.asarray(pred_vec, dtype=np.float64)
+    gt_vec = np.asarray(gt_vec, dtype=np.float64)
+
+    center = get_patch_center_point(pts)
+    scale = robust_vector_scale(pred_vec, gt_vec, pts)
+
+    ax.plot(pts[:, 0], pts[:, 1], "-o", ms=3, color="tab:blue")
+    draw_center_vector(ax, center, pred_vec, color="black", label="pred", scale=scale, lw=2.0)
+    draw_center_vector(ax, center, gt_vec, color="tab:green", label="gt", scale=scale, lw=2.0)
+
+    if show_neg_gt:
+        draw_center_vector(ax, center, -gt_vec, color="tab:red", label="-gt", scale=scale, lw=1.6)
+
+    ax.set_title(title)
+    ax.axis("equal")
+    ax.legend(loc="best", fontsize=8)
 
 def save_example_figure(example: dict, out_path: Path, num_neg_vis: int):
     anchor_pts = example["anchor_pts"]
@@ -445,6 +516,71 @@ def save_example_figure(example: dict, out_path: Path, num_neg_vis: int):
     plt.tight_layout()
     plt.savefig(out_path, dpi=180)
     plt.close()
+
+def get_patch_center_point(pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float64)
+    return pts[len(pts) // 2]
+
+
+def draw_center_vector(ax, center: np.ndarray, vec: np.ndarray, color: str, label: str, scale: float = 1.0, lw: float = 2.0):
+    vec = np.asarray(vec, dtype=np.float64)
+    center = np.asarray(center, dtype=np.float64)
+    ax.arrow(
+        center[0], center[1],
+        scale * vec[0], scale * vec[1],
+        color=color,
+        width=0.0,
+        head_width=0.0,
+        length_includes_head=True,
+        linewidth=lw,
+        label=label,
+    )
+
+
+def robust_vector_scale(pred: np.ndarray, gt: np.ndarray, pts: np.ndarray, frac: float = 0.35) -> float:
+    """
+    Choose a visualization scale so overlaid center vectors are visible
+    relative to the patch size, while preserving direction.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
+    gt = np.asarray(gt, dtype=np.float64)
+
+    mins = pts.min(axis=0)
+    maxs = pts.max(axis=0)
+    patch_extent = float(np.linalg.norm(maxs - mins))
+    patch_extent = max(patch_extent, 1e-8)
+
+    ref = max(float(np.linalg.norm(pred)), float(np.linalg.norm(gt)), 1e-8)
+    return frac * patch_extent / ref
+
+
+def plot_patch_with_center_derivative_overlay(
+    ax,
+    pts: np.ndarray,
+    pred_vec: np.ndarray,
+    gt_vec: np.ndarray,
+    title: str,
+    show_neg_gt: bool = False,
+):
+    pts = np.asarray(pts, dtype=np.float64)
+    pred_vec = np.asarray(pred_vec, dtype=np.float64)
+    gt_vec = np.asarray(gt_vec, dtype=np.float64)
+
+    center = get_patch_center_point(pts)
+    scale = robust_vector_scale(pred_vec, gt_vec, pts)
+
+    ax.plot(pts[:, 0], pts[:, 1], "-o", ms=3, color="tab:blue")
+    draw_center_vector(ax, center, pred_vec, color="black", label="pred", scale=scale, lw=2.0)
+    draw_center_vector(ax, center, gt_vec, color="tab:green", label="gt", scale=scale, lw=2.0)
+
+    if show_neg_gt:
+        draw_center_vector(ax, center, -gt_vec, color="tab:red", label="-gt", scale=scale, lw=1.6)
+
+    ax.set_title(title)
+    ax.axis("equal")
+    ax.legend(loc="best", fontsize=8)
+
 
 
 # ============================================================
@@ -616,6 +752,15 @@ def main():
             p1 = anchor_out["center_first"]
             p2 = anchor_out["center_second"]
 
+            pos_center_pred_f1 = positive_out["center_first"]
+            pos_center_pred_f2 = positive_out["center_second"]
+
+            neg_center_pred_f1 = neg_out["center_first"].view(B, M, 2)
+            neg_center_pred_f2 = neg_out["center_second"].view(B, M, 2)
+
+            pos_center_gt_f1 = apply_linear_map_to_vecs(batch.transform_matrix, gt1_t)
+            pos_center_gt_f2 = apply_linear_map_to_vecs(batch.transform_matrix, gt2_t)
+
             c1 = F.cosine_similarity(p1, gt1_t, dim=-1)
             c2 = F.cosine_similarity(p2, gt2_t, dim=-1)
             a1 = torch.rad2deg(torch.acos(torch.clamp(c1, -1.0, 1.0)))
@@ -697,15 +842,41 @@ def main():
                     "dataset_idx": global_dataset_index + b,
                     "gt_second_norm_fd": float(gt2_norm_list[b]),
                     "gt_second_norm_heron": float(gt2_heron_list[b]),
+
                     "anchor_pts": batch.anchor[b].cpu().numpy(),
                     "pos_pts": batch.positive[b].cpu().numpy(),
                     "neg_pts": batch.negatives[b, :args.num_viz_negatives].cpu().numpy(),
+
                     "anchor_f1": anchor_f1[b].cpu().numpy(),
                     "pos_f1": pos_f1[b].cpu().numpy(),
                     "neg_f1": neg_f1[b, :args.num_viz_negatives].cpu().numpy(),
+
                     "anchor_f2": anchor_f2[b].cpu().numpy(),
                     "pos_f2": pos_f2[b].cpu().numpy(),
                     "neg_f2": neg_f2[b, :args.num_viz_negatives].cpu().numpy(),
+
+                    "anchor_center_pred_f1": p1[b].cpu().numpy(),
+                    "anchor_center_gt_f1": gt1_t[b].cpu().numpy(),
+                    "anchor_center_pred_f2": p2[b].cpu().numpy(),
+                    "anchor_center_gt_f2": gt2_t[b].cpu().numpy(),
+
+                    "pos_center_pred_f1": pos_center_pred_f1[b].cpu().numpy(),
+                    "pos_center_gt_f1": pos_center_gt_f1[b].cpu().numpy(),
+                    "pos_center_pred_f2": pos_center_pred_f2[b].cpu().numpy(),
+                    "pos_center_gt_f2": pos_center_gt_f2[b].cpu().numpy(),
+
+                    "neg_center_pred_f1": neg_center_pred_f1[b, :args.num_viz_negatives].cpu().numpy(),
+                    "neg_center_gt_f1": np.repeat(
+                        gt1_t[b].cpu().numpy()[None, :],
+                        args.num_viz_negatives,
+                        axis=0
+                    ),
+                    "neg_center_pred_f2": neg_center_pred_f2[b, :args.num_viz_negatives].cpu().numpy(),
+                    "neg_center_gt_f2": np.repeat(
+                        gt2_t[b].cpu().numpy()[None, :],
+                        args.num_viz_negatives,
+                        axis=0
+                    ),
                 }
 
                 # Use Heron curvature as the ranking signal, not equiaffine FD magnitude.
@@ -886,6 +1057,7 @@ def main():
     top_examples_sorted = sorted(top_examples, key=lambda x: x[0], reverse=True)
     for rank, (_, ex) in enumerate(top_examples_sorted):
         save_example_figure(ex, out_dir / f"example_{rank:02d}.png", args.num_viz_negatives)
+        save_center_overlay_figure(ex, out_dir / f"example_center_overlay_{rank:02d}.png", args.num_viz_negatives)
 
     # quick text report
     with open(out_dir / "quick_report.txt", "w") as f:
