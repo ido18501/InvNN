@@ -438,8 +438,8 @@ def save_example_figure(example: dict, out_path: Path, num_neg_vis: int):
         plot_patch_with_field(axes[2, 2 + j], neg_pts[j], neg_f2[j], f"Negative {j}: W²(X⁻)X⁻")
 
     fig.suptitle(
-        f"dataset_idx={example['dataset_idx']} | gt_second_norm_fd={example['gt_second_norm_fd']:.4f} | "
-        f"gt_second_norm_heron={example['gt_second_norm_heron']:.4f}",
+        f"dataset_idx={example['dataset_idx']} | heron_kappa={example['gt_second_norm_heron']:.4f} | "
+        f"ea_fd_norm={example['gt_second_norm_fd']:.4f}",
         fontsize=14
     )
     plt.tight_layout()
@@ -707,7 +707,14 @@ def main():
                     "pos_f2": pos_f2[b].cpu().numpy(),
                     "neg_f2": neg_f2[b, :args.num_viz_negatives].cpu().numpy(),
                 }
-                score = sample["gt_second_norm_fd"]
+
+                # Use Heron curvature as the ranking signal, not equiaffine FD magnitude.
+                score = sample["gt_second_norm_heron"]
+
+                # Skip almost-straight examples.
+                if score < 1.0:
+                    continue
+
                 if len(top_examples) < args.num_viz:
                     heapq.heappush(top_examples, (score, sample))
                 else:
