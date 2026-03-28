@@ -224,19 +224,36 @@ def nearest_index(points: np.ndarray, query: np.ndarray) -> int:
     d2 = ((points - query.reshape(1, 2)) ** 2).sum(axis=1)
     return int(np.argmin(d2))
 
+def det2d(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    return float(a[0] * b[1] - a[1] * b[0])
+
 
 def numerical_arc_length_derivatives_on_actual_curve(
     curve_points: np.ndarray,
     anchor_index: int,
     dense_num_points: int = 4096,
+    geometry: str = "euclidean",
+    equiaffine_eps: float = 1e-8,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
-    Main GT:
-      - resample ACTUAL curve uniformly in arc length
-      - nearest dense point to the anchor
-      - centered finite differences in arc length
-    Returns:
-      first_ds, second_ds, dense_anchor_point, ds
+    Numerical derivatives on the ACTUAL sampled curve.
+
+    geometry == "euclidean":
+        returns:
+            dx/ds_euc, d²x/ds_euc², dense_anchor_point, ds_euc
+
+    geometry == "equiaffine":
+        uses the dense Euclidean-arc-length parameter t := s_euc,
+        estimates x_t, x_tt, then converts to equiaffine-arc-length derivatives:
+            phi   = (|det(x_t, x_tt)| + eps)^(1/3)
+            x_s   = x_t / phi
+            x_ss  = x_tt / phi^2 - (phi_t / phi^3) x_t
+        where phi_t is estimated by centered finite differences in t.
+
+        returns:
+            dx/ds_ea, d²x/ds_ea², dense_anchor_point, ds_euc
     """
     curve_points = np.asarray(curve_points, dtype=np.float64)
     dense = resample_closed_curve_uniform_arc_length(curve_points, num_points=dense_num_points)
@@ -246,19 +263,58 @@ def numerical_arc_length_derivatives_on_actual_curve(
 
     extended = np.vstack([curve_points, curve_points[:1]])
     total_length = float(np.linalg.norm(np.diff(extended, axis=0), axis=1).sum())
-    ds = total_length / dense_num_points
+    ds = total_length / dense_num_points  # this is the dense Euclidean arc-length step
 
-    prev_pt = dense[(k - 1) % dense_num_points]
-    curr_pt = dense[k]
-    next_pt = dense[(k + 1) % dense_num_points]
+    def pt(idx: int) -> np.ndarray:
+        return dense[idx % dense_num_points]
 
-    first = (next_pt - prev_pt) / (2.0 * ds)
-    first_norm = np.linalg.norm(first)
-    if first_norm > 1e-12:
-        first = first / first_norm
+    curr_pt = pt(k)
 
-    second = (next_pt - 2.0 * curr_pt + prev_pt) / (ds ** 2)
-    return first.astype(np.float64), second.astype(np.float64), curr_pt.astype(np.float64), float(ds)
+    # centered derivatives at k with respect to dense Euclidean arc length t = s_euc
+    prev_pt = pt(k - 1)
+    next_pt = pt(k + 1)
+
+    first_raw = (next_pt - prev_pt) / (2.0 * ds)
+    second_raw = (next_pt - 2.0 * curr_pt + prev_pt) / (ds ** 2)
+
+    if geometry == "euclidean":
+        first = first_raw.copy()
+        first_norm = np.linalg.norm(first)
+        if first_norm > 1e-12:
+            first = first / first_norm
+        second = second_raw
+        return first.astype(np.float64), second.astype(np.float64), curr_pt.astype(np.float64), float(ds)
+
+    if geometry != "equiaffine":
+        raise ValueError(f"Unsupported geometry: {geometry}")
+
+    # Need phi_t, so estimate phi at k-1, k, k+1
+    def first_second_at(center_idx: int) -> tuple[np.ndarray, np.ndarray]:
+        p_prev = pt(center_idx - 1)
+        p_curr = pt(center_idx)
+        p_next = pt(center_idx + 1)
+        f1 = (p_next - p_prev) / (2.0 * ds)
+        f2 = (p_next - 2.0 * p_curr + p_prev) / (ds ** 2)
+        return f1, f2
+
+    first_m1, second_m1 = first_second_at(k - 1)
+    first_0, second_0 = first_raw, second_raw
+    first_p1, second_p1 = first_second_at(k + 1)
+
+    g_m1 = det2d(first_m1, second_m1)
+    g_0 = det2d(first_0, second_0)
+    g_p1 = det2d(first_p1, second_p1)
+
+    phi_m1 = (abs(g_m1) + equiaffine_eps) ** (1.0 / 3.0)
+    phi_0 = (abs(g_0) + equiaffine_eps) ** (1.0 / 3.0)
+    phi_p1 = (abs(g_p1) + equiaffine_eps) ** (1.0 / 3.0)
+
+    phi_t = (phi_p1 - phi_m1) / (2.0 * ds)
+
+    first_ea = first_0 / phi_0
+    second_ea = second_0 / (phi_0 ** 2) - (phi_t / (phi_0 ** 3)) * first_0
+
+    return first_ea.astype(np.float64), second_ea.astype(np.float64), curr_pt.astype(np.float64), float(ds)
 
 
 def heron_three_point_curvature_magnitude(
@@ -408,6 +464,8 @@ def main():
     parser.add_argument("--audit-indices", type=int, default=64)
     parser.add_argument("--fd-dense-points", type=int, default=4096)
     parser.add_argument("--curvature-thresholds", type=float, nargs="*", default=[0.0, 0.05, 0.1, 0.25, 0.5, 1.0])
+    parser.add_argument("--equiaffine", action="store_true")
+    parser.add_argument("--equiaffine-eps", type=float, default=1e-8)
     args = parser.parse_args()
 
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -416,6 +474,7 @@ def main():
 
     cfg = json.loads((checkpoint_dir / "config.json").read_text())
     device = torch.device(args.device)
+    derivative_geometry = "equiaffine" if args.equiaffine else "euclidean"
 
     dataset = build_dataset_from_config(cfg, args.split)
     loader = DataLoader(
@@ -531,6 +590,8 @@ def main():
                     curve_points=np.asarray(curve_points, dtype=np.float64),
                     anchor_index=int(anchor_center_idx_cpu[b]),
                     dense_num_points=args.fd_dense_points,
+                    geometry=derivative_geometry,
+                    equiaffine_eps=args.equiaffine_eps,
                 )
                 gt2_h = heron_three_point_curvature_magnitude(
                     curve_points=np.asarray(curve_points, dtype=np.float64),
@@ -687,6 +748,8 @@ def main():
         "checkpoint_dir": str(checkpoint_dir),
         "split": args.split,
         "config_used": cfg,
+        "derivative_geometry": derivative_geometry,
+        "equiaffine_eps": float(args.equiaffine_eps),
         "analytic_gt_audit": analytic_audit,
 
         "curvature_actual_geometry": {
@@ -767,12 +830,18 @@ def main():
         neg_proj2=np.asarray(neg_proj2),
     )
 
+    deriv1_label = "dx/ds_ea" if args.equiaffine else "dx/ds"
+    deriv2_label = "d²x/ds_ea²" if args.equiaffine else "d²x/ds²"
+    gt2_norm_title = "GT second-derivative norm (equiaffine)" if args.equiaffine else "GT second-derivative norm (FD on actual geometry)"
+    gt2_norm_xlabel = f"||{deriv2_label}||"
     # plots
-    plot_hist(gt_second_norm_arr, "GT second-derivative norm (FD on actual geometry)", "||gt_second||", out_dir / "hist_gt_second_norm_fd.png")
+    plot_hist(gt_second_norm_arr, gt2_norm_title, gt2_norm_xlabel, out_dir / "hist_gt_second_norm_fd.png")
     plot_hist(gt_second_norm_heron_arr, "GT curvature magnitude (Heron on actual geometry)", "kappa", out_dir / "hist_gt_second_norm_heron.png")
 
-    plot_hist(first_cos_arr, "First derivative cosine", "cos(pred_first, gt_first_num)", out_dir / "hist_first_cos.png")
-    plot_hist(second_cos_arr, "Second derivative cosine", "cos(pred_second, gt_second_num)", out_dir / "hist_second_cos.png")
+    plot_hist(first_cos_arr, f"First derivative cosine ({deriv1_label})", "cos(pred_first, gt_first_num)",
+              out_dir / "hist_first_cos.png")
+    plot_hist(second_cos_arr, f"Second derivative cosine ({deriv2_label})", "cos(pred_second, gt_second_num)",
+              out_dir / "hist_second_cos.png")
 
     plot_hist(first_residual_arr, "First residual angle", "deg", out_dir / "hist_first_residual_angle.png")
     plot_hist(second_residual_arr, "Second residual angle", "deg", out_dir / "hist_second_residual_angle.png")
@@ -789,8 +858,22 @@ def main():
 
     # scatter plots for your hypothesis
     gt_second_norm_safe = np.maximum(gt_second_norm_arr, 1e-6)
-    plot_scatter(gt_second_norm_safe, second_cos_arr, "Second cosine vs GT curvature norm", "GT ||second|| (FD)", "cos(pred_second, gt_second)", out_dir / "scatter_second_cos_vs_gt_curvature.png")
-    plot_scatter(gt_second_norm_safe, pred_second_norm_arr, "Pred second norm vs GT curvature norm", "GT ||second|| (FD)", "||pred_second||", out_dir / "scatter_pred_second_norm_vs_gt_curvature.png")
+    plot_scatter(
+        gt_second_norm_safe,
+        second_cos_arr,
+        f"Second cosine vs GT second-derivative norm ({derivative_geometry})",
+        gt2_norm_xlabel,
+        "cos(pred_second, gt_second)",
+        out_dir / "scatter_second_cos_vs_gt_curvature.png",
+    )
+    plot_scatter(
+        gt_second_norm_safe,
+        pred_second_norm_arr,
+        f"Pred second norm vs GT second-derivative norm ({derivative_geometry})",
+        gt2_norm_xlabel,
+        "||pred_second||",
+        out_dir / "scatter_pred_second_norm_vs_gt_curvature.png",
+    )
 
     # save top high-curvature examples
     top_examples_sorted = sorted(top_examples, key=lambda x: x[0], reverse=True)
@@ -800,6 +883,13 @@ def main():
     # quick text report
     with open(out_dir / "quick_report.txt", "w") as f:
         f.write("=== IMPORTANT ===\n")
+        f.write(f"Derivative geometry mode: {derivative_geometry}\n")
+        if args.equiaffine:
+            f.write(
+                "Equiaffine mode uses the dense Euclidean-arc-length parameter as a temporary parameter t, "
+                "then converts x_t, x_tt to x_{s_ea}, x_{s_ea s_ea}. "
+                "The Heron curvature quantity remains a Euclidean curvature cross-check only.\n"
+            )
         f.write("Use numerical_gt results below for derivative interpretation.\n")
         f.write("If analytic_gt_audit.point_match_error is not ~0, the old analytic derivative evaluation is invalid.\n\n")
         f.write("=== analytic gt audit ===\n")
