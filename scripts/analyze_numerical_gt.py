@@ -517,6 +517,83 @@ def save_example_figure(example: dict, out_path: Path, num_neg_vis: int):
     plt.savefig(out_path, dpi=180)
     plt.close()
 
+
+def save_center_overlay_figure(example: dict, out_path: Path, num_neg_vis: int):
+    anchor_pts = example["anchor_pts"]
+    pos_pts = example["pos_pts"]
+    neg_pts = example["neg_pts"][:num_neg_vis]
+
+    cols = 2 + len(neg_pts)
+    fig, axes = plt.subplots(2, cols, figsize=(4 * cols, 7.5))
+
+    # ===== FIRST DERIVATIVE =====
+    plot_patch_with_center_derivative_overlay(
+        axes[0, 0],
+        anchor_pts,
+        example["anchor_center_pred_f1"],
+        example["anchor_center_gt_f1"],
+        "Anchor center: pred/gt first",
+        show_neg_gt=False,
+    )
+
+    plot_patch_with_center_derivative_overlay(
+        axes[0, 1],
+        pos_pts,
+        example["pos_center_pred_f1"],
+        example["pos_center_gt_f1"],
+        "Positive center: pred/gt first",
+        show_neg_gt=False,
+    )
+
+    for j in range(len(neg_pts)):
+        plot_patch_with_center_derivative_overlay(
+            axes[0, 2 + j],
+            neg_pts[j],
+            example["neg_center_pred_f1"][j],
+            example["neg_center_gt_f1"][j],
+            f"Negative {j} center: pred/gt first",
+            show_neg_gt=False,
+        )
+
+    # ===== SECOND DERIVATIVE =====
+    plot_patch_with_center_derivative_overlay(
+        axes[1, 0],
+        anchor_pts,
+        example["anchor_center_pred_f2"],
+        example["anchor_center_gt_f2"],
+        "Anchor center: pred/gt second",
+        show_neg_gt=True,
+    )
+
+    plot_patch_with_center_derivative_overlay(
+        axes[1, 1],
+        pos_pts,
+        example["pos_center_pred_f2"],
+        example["pos_center_gt_f2"],
+        "Positive center: pred/gt second",
+        show_neg_gt=True,
+    )
+
+    for j in range(len(neg_pts)):
+        plot_patch_with_center_derivative_overlay(
+            axes[1, 2 + j],
+            neg_pts[j],
+            example["neg_center_pred_f2"][j],
+            example["neg_center_gt_f2"][j],
+            f"Negative {j} center: pred/gt second",
+            show_neg_gt=True,
+        )
+
+    fig.suptitle(
+        f"dataset_idx={example['dataset_idx']} | heron_kappa={example['gt_second_norm_heron']:.4f} | "
+        f"ea_fd_norm={example['gt_second_norm_fd']:.4f}",
+        fontsize=14
+    )
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+
 def get_patch_center_point(pts: np.ndarray) -> np.ndarray:
     pts = np.asarray(pts, dtype=np.float64)
     return pts[len(pts) // 2]
