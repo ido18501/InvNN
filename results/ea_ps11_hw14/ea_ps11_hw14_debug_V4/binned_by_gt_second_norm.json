@@ -1,0 +1,46 @@
+{
+  "[0.0, 0.001)": {
+    "count": 2,
+    "second_cos_mean": -0.9988660514354706,
+    "second_cos_median": -0.9988660514354706,
+    "second_abs_cos_mean": 0.9988660514354706,
+    "second_abs_cos_median": 0.9988660514354706,
+    "gt_norm_mean": 4.28244124344438e-05,
+    "pred_norm_mean": 0.021473301108926535,
+    "norm_ratio_mean": 486.8794249082436,
+    "log_norm_diff_mean": 2.678899408653203
+  },
+  "[1.0, 10.0)": {
+    "count": 86,
+    "second_cos_mean": -0.09738130962779355,
+    "second_cos_median": -0.21096929907798767,
+    "second_abs_cos_mean": 0.6890940928701744,
+    "second_abs_cos_median": 0.7638800144195557,
+    "gt_norm_mean": 5.717102034602593,
+    "pred_norm_mean": 0.06618853695798925,
+    "norm_ratio_mean": 0.011144298971034984,
+    "log_norm_diff_mean": -2.2397708853989795
+  },
+  "[10.0, 100.0)": {
+    "count": 507,
+    "second_cos_mean": -0.035892538946761185,
+    "second_cos_median": -0.827974259853363,
+    "second_abs_cos_mean": 0.9728177674775998,
+    "second_abs_cos_median": 0.9980413317680359,
+    "gt_norm_mean": 48.68851274640176,
+    "pred_norm_mean": 0.15212197303202524,
+    "norm_ratio_mean": 0.003490858259827734,
+    "log_norm_diff_mean": -2.9591654205579645
+  },
+  "[100.0, inf)": {
+    "count": 429,
+    "second_cos_mean": 0.07796857156953611,
+    "second_cos_median": 0.9972973465919495,
+    "second_abs_cos_mean": 0.995669155687719,
+    "second_abs_cos_median": 0.9999112486839294,
+    "gt_norm_mean": 7681617028.668492,
+    "pred_norm_mean": 0.17114419772317915,
+    "norm_ratio_mean": 0.00033691500902933817,
+    "log_norm_diff_mean": -5.16543675276775
+  }
+}

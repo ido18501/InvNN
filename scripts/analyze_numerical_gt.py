@@ -136,6 +136,51 @@ def apply_linear_map_to_vecs(T: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """
     return torch.einsum("bij,bj->bi", T, v)
 
+def affine_det_scale(T: torch.Tensor, power: float, eps: float = 1e-12) -> torch.Tensor:
+    """
+    T: (..., 2, 2)
+    returns: (...) scalar scale = |det(T)|^power
+    """
+    det = T[..., 0, 0] * T[..., 1, 1] - T[..., 0, 1] * T[..., 1, 0]
+    return torch.clamp(det.abs(), min=eps).pow(power)
+
+
+def apply_affine_map_to_vecs(T: torch.Tensor, v: torch.Tensor, derivative_order: int) -> torch.Tensor:
+    """
+    T: (B,2,2)
+    v: (B,2)
+    derivative_order:
+        0 -> A v
+        1 -> |det A|^(-1/3) A v
+        2 -> |det A|^(-2/3) A v
+    """
+    out = torch.einsum("bij,bj->bi", T, v)
+    if derivative_order == 0:
+        return out
+    if derivative_order == 1:
+        scale = affine_det_scale(T, power=-1.0 / 3.0).unsqueeze(-1)
+        return scale * out
+    if derivative_order == 2:
+        scale = affine_det_scale(T, power=-2.0 / 3.0).unsqueeze(-1)
+        return scale * out
+    raise ValueError(f"Unsupported derivative_order: {derivative_order}")
+
+
+def apply_affine_map_to_field(T: torch.Tensor, field: torch.Tensor, derivative_order: int) -> torch.Tensor:
+    """
+    T: (B,2,2)
+    field: (B,K,2)
+    """
+    out = torch.einsum("bij,bkj->bki", T, field)
+    if derivative_order == 0:
+        return out
+    if derivative_order == 1:
+        scale = affine_det_scale(T, power=-1.0 / 3.0).view(-1, 1, 1)
+        return scale * out
+    if derivative_order == 2:
+        scale = affine_det_scale(T, power=-2.0 / 3.0).view(-1, 1, 1)
+        return scale * out
+    raise ValueError(f"Unsupported derivative_order: {derivative_order}")
 
 def frame_residual_angles_deg(pred: torch.Tensor, gt_dir: torch.Tensor) -> np.ndarray:
     pred_u = pred / (pred.norm(dim=-1, keepdim=True) + 1e-12)
@@ -293,7 +338,7 @@ def numerical_arc_length_derivatives_on_actual_curve(
         second = second_raw
         return first.astype(np.float64), second.astype(np.float64), curr_pt.astype(np.float64), float(ds)
 
-    if geometry != "equiaffine":
+    if geometry not in ("equiaffine", "affine"):
         raise ValueError(f"Unsupported geometry: {geometry}")
 
     # Need phi_t, so estimate phi at k-1, k, k+1
@@ -677,7 +722,12 @@ def main():
     parser.add_argument("--audit-indices", type=int, default=64)
     parser.add_argument("--fd-dense-points", type=int, default=4096)
     parser.add_argument("--curvature-thresholds", type=float, nargs="*", default=[0.0, 0.05, 0.1, 0.25, 0.5, 1.0])
-    parser.add_argument("--equiaffine", action="store_true")
+    parser.add_argument(
+        "--geometry",
+        type=str,
+        default="euclidean",
+        choices=["euclidean", "equiaffine", "affine"],
+    )
     parser.add_argument("--equiaffine-eps", type=float, default=1e-8)
     args = parser.parse_args()
 
@@ -687,7 +737,7 @@ def main():
 
     cfg = json.loads((checkpoint_dir / "config.json").read_text())
     device = torch.device(args.device)
-    derivative_geometry = "equiaffine" if args.equiaffine else "euclidean"
+    derivative_geometry = args.geometry
 
     dataset = build_dataset_from_config(cfg, args.split)
     loader = DataLoader(
@@ -782,8 +832,12 @@ def main():
             pos_f2 = apply_W(pos_op, pos_f1)
             neg_f2 = apply_W(neg_op.view(B * M, K, K), neg_out["field_first"]).view(B, M, K, 2)
 
-            target_f1 = model.apply_linear_map_to_field(batch.transform_matrix, anchor_f1)
-            target_f2 = model.apply_linear_map_to_field(batch.transform_matrix, anchor_f2)
+            if derivative_geometry == "euclidean":
+                target_f1 = model.apply_linear_map_to_field(batch.transform_matrix, anchor_f1)
+                target_f2 = model.apply_linear_map_to_field(batch.transform_matrix, anchor_f2)
+            else:
+                target_f1 = apply_affine_map_to_field(batch.transform_matrix, anchor_f1, derivative_order=1)
+                target_f2 = apply_affine_map_to_field(batch.transform_matrix, anchor_f2, derivative_order=2)
 
             # ===== per-sample numerical GT from ACTUAL sampled curve =====
             gt1_list = []
@@ -835,8 +889,12 @@ def main():
             neg_center_pred_f1 = neg_out["center_first"].view(B, M, 2)
             neg_center_pred_f2 = neg_out["center_second"].view(B, M, 2)
 
-            pos_center_gt_f1 = apply_linear_map_to_vecs(batch.transform_matrix, gt1_t)
-            pos_center_gt_f2 = apply_linear_map_to_vecs(batch.transform_matrix, gt2_t)
+            if derivative_geometry == "euclidean":
+                pos_center_gt_f1 = apply_linear_map_to_vecs(batch.transform_matrix, gt1_t)
+                pos_center_gt_f2 = apply_linear_map_to_vecs(batch.transform_matrix, gt2_t)
+            else:
+                pos_center_gt_f1 = apply_affine_map_to_vecs(batch.transform_matrix, gt1_t, derivative_order=1)
+                pos_center_gt_f2 = apply_affine_map_to_vecs(batch.transform_matrix, gt2_t, derivative_order=2)
 
             c1 = F.cosine_similarity(p1, gt1_t, dim=-1)
             c2 = F.cosine_similarity(p2, gt2_t, dim=-1)
@@ -1085,9 +1143,14 @@ def main():
         neg_proj2=np.asarray(neg_proj2),
     )
 
-    deriv1_label = "dx/ds_ea" if args.equiaffine else "dx/ds"
-    deriv2_label = "d²x/ds_ea²" if args.equiaffine else "d²x/ds²"
-    gt2_norm_title = "GT second-derivative norm (equiaffine)" if args.equiaffine else "GT second-derivative norm (FD on actual geometry)"
+    if derivative_geometry == "euclidean":
+        deriv1_label = "dx/ds"
+        deriv2_label = "d²x/ds²"
+        gt2_norm_title = "GT second-derivative norm (Euclidean)"
+    else:
+        deriv1_label = "dx/ds_aff"
+        deriv2_label = "d²x/ds_aff²"
+        gt2_norm_title = f"GT second-derivative norm ({derivative_geometry})"
     gt2_norm_xlabel = f"||{deriv2_label}||"
     # plots
     plot_hist(gt_second_norm_arr, gt2_norm_title, gt2_norm_xlabel, out_dir / "hist_gt_second_norm_fd.png")
@@ -1140,7 +1203,7 @@ def main():
     with open(out_dir / "quick_report.txt", "w") as f:
         f.write("=== IMPORTANT ===\n")
         f.write(f"Derivative geometry mode: {derivative_geometry}\n")
-        if args.equiaffine:
+        if derivative_geometry in ("equiaffine", "affine"):
             f.write(
                 "Equiaffine mode uses the dense Euclidean-arc-length parameter as a temporary parameter t, "
                 "then converts x_t, x_tt to x_{s_ea}, x_{s_ea s_ea}. "
