@@ -182,6 +182,24 @@ def apply_affine_map_to_field(T: torch.Tensor, field: torch.Tensor, derivative_o
         return scale * out
     raise ValueError(f"Unsupported derivative_order: {derivative_order}")
 
+def apply_similarity_map_to_vecs(T: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Similarity case: both first and second derivatives with respect to
+    similarity arc-length transform simply as A v.
+    T: (B,2,2)
+    v: (B,2)
+    """
+    return torch.einsum("bij,bj->bi", T, v)
+
+
+def apply_similarity_map_to_field(T: torch.Tensor, field: torch.Tensor) -> torch.Tensor:
+    """
+    Similarity case: field transforms simply as A field.
+    T: (B,2,2)
+    field: (B,K,2)
+    """
+    return torch.einsum("bij,bkj->bki", T, field)
+
 def frame_residual_angles_deg(pred: torch.Tensor, gt_dir: torch.Tensor) -> np.ndarray:
     pred_u = pred / (pred.norm(dim=-1, keepdim=True) + 1e-12)
     gt_u = gt_dir / (gt_dir.norm(dim=-1, keepdim=True) + 1e-12)
@@ -289,6 +307,7 @@ def numerical_arc_length_derivatives_on_actual_curve(
     dense_num_points: int = 4096,
     geometry: str = "euclidean",
     equiaffine_eps: float = 1e-8,
+    similarity_eps: float = 1e-8,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Numerical derivatives on the ACTUAL sampled curve.
@@ -296,6 +315,17 @@ def numerical_arc_length_derivatives_on_actual_curve(
     geometry == "euclidean":
         returns:
             dx/ds_euc, d²x/ds_euc², dense_anchor_point, ds_euc
+
+    geometry == "similarity":
+        uses dense Euclidean arc-length parameter s, estimates x_s, x_ss,
+        signed curvature kappa(s), and kappa_s, then converts to
+        similarity-arc-length derivatives:
+            x_sigma   = x_s / kappa
+            x_sigmasigma = x_ss / kappa^2 - (kappa_s / kappa^3) x_s
+
+        NOTE:
+        This is singular near kappa = 0, so we use similarity_eps to
+        regularize the denominator.
 
     geometry == "equiaffine":
         uses the dense Euclidean-arc-length parameter t := s_euc,
@@ -316,32 +346,13 @@ def numerical_arc_length_derivatives_on_actual_curve(
 
     extended = np.vstack([curve_points, curve_points[:1]])
     total_length = float(np.linalg.norm(np.diff(extended, axis=0), axis=1).sum())
-    ds = total_length / dense_num_points  # this is the dense Euclidean arc-length step
+    ds = total_length / dense_num_points  # dense Euclidean arc-length step
 
     def pt(idx: int) -> np.ndarray:
         return dense[idx % dense_num_points]
 
     curr_pt = pt(k)
 
-    # centered derivatives at k with respect to dense Euclidean arc length t = s_euc
-    prev_pt = pt(k - 1)
-    next_pt = pt(k + 1)
-
-    first_raw = (next_pt - prev_pt) / (2.0 * ds)
-    second_raw = (next_pt - 2.0 * curr_pt + prev_pt) / (ds ** 2)
-
-    if geometry == "euclidean":
-        first = first_raw.copy()
-        first_norm = np.linalg.norm(first)
-        if first_norm > 1e-12:
-            first = first / first_norm
-        second = second_raw
-        return first.astype(np.float64), second.astype(np.float64), curr_pt.astype(np.float64), float(ds)
-
-    if geometry not in ("equiaffine", "affine"):
-        raise ValueError(f"Unsupported geometry: {geometry}")
-
-    # Need phi_t, so estimate phi at k-1, k, k+1
     def first_second_at(center_idx: int) -> tuple[np.ndarray, np.ndarray]:
         p_prev = pt(center_idx - 1)
         p_curr = pt(center_idx)
@@ -351,8 +362,45 @@ def numerical_arc_length_derivatives_on_actual_curve(
         return f1, f2
 
     first_m1, second_m1 = first_second_at(k - 1)
-    first_0, second_0 = first_raw, second_raw
+    first_0, second_0 = first_second_at(k)
     first_p1, second_p1 = first_second_at(k + 1)
+
+    if geometry == "euclidean":
+        first = first_0.copy()
+        first_norm = np.linalg.norm(first)
+        if first_norm > 1e-12:
+            first = first / first_norm
+        second = second_0
+        return first.astype(np.float64), second.astype(np.float64), curr_pt.astype(np.float64), float(ds)
+
+    if geometry == "similarity":
+        def signed_curvature(x_s: np.ndarray, x_ss: np.ndarray) -> float:
+            denom = max(np.linalg.norm(x_s) ** 3, 1e-12)
+            return det2d(x_s, x_ss) / denom
+
+        kappa_m1 = signed_curvature(first_m1, second_m1)
+        kappa_0 = signed_curvature(first_0, second_0)
+        kappa_p1 = signed_curvature(first_p1, second_p1)
+
+        kappa_s = (kappa_p1 - kappa_m1) / (2.0 * ds)
+
+        if abs(kappa_0) < similarity_eps:
+            kappa_safe = similarity_eps if kappa_0 >= 0.0 else -similarity_eps
+        else:
+            kappa_safe = kappa_0
+
+        first_sim = first_0 / kappa_safe
+        second_sim = second_0 / (kappa_safe ** 2) - (kappa_s / (kappa_safe ** 3)) * first_0
+
+        return (
+            first_sim.astype(np.float64),
+            second_sim.astype(np.float64),
+            curr_pt.astype(np.float64),
+            float(ds),
+        )
+
+    if geometry not in ("equiaffine", "affine"):
+        raise ValueError(f"Unsupported geometry: {geometry}")
 
     g_m1 = det2d(first_m1, second_m1)
     g_0 = det2d(first_0, second_0)
@@ -555,7 +603,7 @@ def save_example_figure(example: dict, out_path: Path, num_neg_vis: int):
 
     fig.suptitle(
         f"dataset_idx={example['dataset_idx']} | heron_kappa={example['gt_second_norm_heron']:.4f} | "
-        f"ea_fd_norm={example['gt_second_norm_fd']:.4f}",
+        f"geom_fd_norm={example['gt_second_norm_fd']:.4f}",
         fontsize=14
     )
     plt.tight_layout()
@@ -726,9 +774,10 @@ def main():
         "--geometry",
         type=str,
         default="euclidean",
-        choices=["euclidean", "equiaffine", "affine"],
+        choices=["euclidean", "similarity", "equiaffine", "affine"],
     )
     parser.add_argument("--equiaffine-eps", type=float, default=1e-8)
+    parser.add_argument("--similarity-eps", type=float, default=1e-8)
     args = parser.parse_args()
 
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -832,9 +881,9 @@ def main():
             pos_f2 = apply_W(pos_op, pos_f1)
             neg_f2 = apply_W(neg_op.view(B * M, K, K), neg_out["field_first"]).view(B, M, K, 2)
 
-            if derivative_geometry == "euclidean":
-                target_f1 = model.apply_linear_map_to_field(batch.transform_matrix, anchor_f1)
-                target_f2 = model.apply_linear_map_to_field(batch.transform_matrix, anchor_f2)
+            if derivative_geometry in ("euclidean", "similarity"):
+                target_f1 = apply_similarity_map_to_field(batch.transform_matrix, anchor_f1)
+                target_f2 = apply_similarity_map_to_field(batch.transform_matrix, anchor_f2)
             else:
                 target_f1 = apply_affine_map_to_field(batch.transform_matrix, anchor_f1, derivative_order=1)
                 target_f2 = apply_affine_map_to_field(batch.transform_matrix, anchor_f2, derivative_order=2)
@@ -859,6 +908,7 @@ def main():
                     dense_num_points=args.fd_dense_points,
                     geometry=derivative_geometry,
                     equiaffine_eps=args.equiaffine_eps,
+                    similarity_eps=args.similarity_eps,
                 )
                 gt2_h = heron_three_point_curvature_magnitude(
                     curve_points=np.asarray(curve_points, dtype=np.float64),
@@ -889,9 +939,9 @@ def main():
             neg_center_pred_f1 = neg_out["center_first"].view(B, M, 2)
             neg_center_pred_f2 = neg_out["center_second"].view(B, M, 2)
 
-            if derivative_geometry == "euclidean":
-                pos_center_gt_f1 = apply_linear_map_to_vecs(batch.transform_matrix, gt1_t)
-                pos_center_gt_f2 = apply_linear_map_to_vecs(batch.transform_matrix, gt2_t)
+            if derivative_geometry in ("euclidean", "similarity"):
+                pos_center_gt_f1 = apply_similarity_map_to_vecs(batch.transform_matrix, gt1_t)
+                pos_center_gt_f2 = apply_similarity_map_to_vecs(batch.transform_matrix, gt2_t)
             else:
                 pos_center_gt_f1 = apply_affine_map_to_vecs(batch.transform_matrix, gt1_t, derivative_order=1)
                 pos_center_gt_f2 = apply_affine_map_to_vecs(batch.transform_matrix, gt2_t, derivative_order=2)
@@ -1064,6 +1114,7 @@ def main():
         "derivative_geometry": derivative_geometry,
         "equiaffine_eps": float(args.equiaffine_eps),
         "analytic_gt_audit": analytic_audit,
+        "similarity_eps": float(args.similarity_eps),
 
         "curvature_actual_geometry": {
             "gt_second_norm_fd": summarize_array(gt_second_norm_arr),
@@ -1147,9 +1198,13 @@ def main():
         deriv1_label = "dx/ds"
         deriv2_label = "d²x/ds²"
         gt2_norm_title = "GT second-derivative norm (Euclidean)"
+    elif derivative_geometry == "similarity":
+        deriv1_label = "dx/dσ_sim"
+        deriv2_label = "d²x/dσ_sim²"
+        gt2_norm_title = "GT second-derivative norm (Similarity)"
     else:
-        deriv1_label = "dx/ds_aff"
-        deriv2_label = "d²x/ds_aff²"
+        deriv1_label = f"dx/ds_{derivative_geometry}"
+        deriv2_label = f"d²x/ds_{derivative_geometry}²"
         gt2_norm_title = f"GT second-derivative norm ({derivative_geometry})"
     gt2_norm_xlabel = f"||{deriv2_label}||"
     # plots
@@ -1203,7 +1258,15 @@ def main():
     with open(out_dir / "quick_report.txt", "w") as f:
         f.write("=== IMPORTANT ===\n")
         f.write(f"Derivative geometry mode: {derivative_geometry}\n")
-        if derivative_geometry in ("equiaffine", "affine"):
+        if derivative_geometry == "similarity":
+            f.write(
+                "Similarity mode uses dense Euclidean arc-length s as a temporary parameter, "
+                "estimates signed curvature kappa(s) and kappa_s, and converts to "
+                "x_sigma = x_s / kappa and x_sigmasigma = x_ss / kappa^2 - (kappa_s / kappa^3) x_s. "
+                "This is singular near kappa=0, so similarity_eps regularization is used. "
+                "The Heron curvature quantity remains a Euclidean curvature cross-check only.\n"
+            )
+        elif derivative_geometry in ("equiaffine", "affine"):
             f.write(
                 "Equiaffine mode uses the dense Euclidean-arc-length parameter as a temporary parameter t, "
                 "then converts x_t, x_tt to x_{s_ea}, x_{s_ea s_ea}. "
