@@ -69,13 +69,6 @@ class TangentOperatorModel(nn.Module):
         )
 
         self.output_scale = nn.Parameter(torch.tensor(1.0)) if learn_scale else None
-        self._init_last_layer()
-
-    def _init_last_layer(self) -> None:
-        last = self.operator_head.net[-1]
-        if isinstance(last, nn.Linear):
-            nn.init.normal_(last.weight, mean=0.0, std=self.operator_init_scale)
-            nn.init.zeros_(last.bias)
 
     def _prepare_operator_input(self, x: torch.Tensor) -> torch.Tensor:
         if self.centered_input_for_operator:
