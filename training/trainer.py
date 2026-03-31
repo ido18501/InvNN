@@ -318,18 +318,79 @@ class TangentTrainer:
                 f"Suspicious init bias detected: mean init cosine = {mean_cos:.6f}. "
                 "Model appears aligned with GT before training."
             )
+
+    def debug_patch_geometry(self, loader, num_examples: int = 5):
+        self.model.eval()
+
+        with torch.no_grad():
+            batch = next(iter(loader))
+            batch = self._move_batch(batch)
+
+            print("\n[debug patch geometry]")
+            k = min(num_examples, batch.anchor.shape[0])
+
+            for i in range(k):
+                pts = batch.anchor[i]  # [K,2], centered patch
+                cov = pts.T @ pts
+                eigvals, eigvecs = torch.linalg.eigh(cov)
+                # eigvals ascending
+                small = float(eigvals[0].item())
+                large = float(eigvals[1].item())
+                ratio = 0.0 if large == 0 else small / large
+
+                tangent_like = eigvecs[:, 1]
+                gt = batch.gt_first_anchor[i]
+                gt_n = gt / (gt.norm() + 1e-8)
+                tan_n = tangent_like / (tangent_like.norm() + 1e-8)
+
+                cos_tan_gt = float(torch.abs(torch.dot(tan_n, gt_n)).item())
+
+                print(f"\nexample {i}")
+                print("small eig:", small)
+                print("large eig:", large)
+                print("small/large ratio:", ratio)
+                print("|cos(PCA_tangent, gt_first)|:", cos_tan_gt)
+                print("patch:")
+                print(pts.detach().cpu().numpy())
+
+    def debug_pred_vs_pca_tangent(self, loader, num_examples: int = 5):
+        self.model.eval()
+
+        with torch.no_grad():
+            batch = next(iter(loader))
+            batch = self._move_batch(batch)
+            anchor_out, _, _ = self._forward_triplet(batch)
+
+            print("\n[debug pred vs PCA tangent]")
+            k = min(num_examples, batch.anchor.shape[0])
+
+            for i in range(k):
+                pts = batch.anchor[i]
+                pred = anchor_out['pred'][i]
+                gt = batch.gt_first_anchor[i]
+
+                cov = pts.T @ pts
+                eigvals, eigvecs = torch.linalg.eigh(cov)
+                tangent_like = eigvecs[:, 1]
+
+                pred_n = pred / (pred.norm() + 1e-8)
+                tan_n = tangent_like / (tangent_like.norm() + 1e-8)
+                gt_n = gt / (gt.norm() + 1e-8)
+
+                cos_pred_tan = float(torch.abs(torch.dot(pred_n, tan_n)).item())
+                cos_pred_gt = float(torch.abs(torch.dot(pred_n, gt_n)).item())
+
+                print(f"\nexample {i}")
+                print("|cos(pred, PCA_tangent)|:", cos_pred_tan)
+                print("|cos(pred, gt_first)|:", cos_pred_gt)
+                print("pred norm:", float(pred.norm().item()))
     def fit(self, train_loader, val_loader, num_epochs, early_stopping_patience=10):
         best_val = float('inf')
         best_epoch = 0
         patience = 0
         best_model_path = self.checkpoint_dir / 'best_model.pt'
-        self.debug_init_examples(train_loader, num_examples=5)
-        self.evaluate_once(train_loader, split_name="train_init")
-        self.evaluate_once(val_loader, split_name="val_init")
-        self.debug_sign_examples(train_loader, num_examples=5)
-        self.evaluate_once(train_loader, split_name="train_init")
-        self.evaluate_once(val_loader, split_name="val_init")
-        self.assert_init_not_biased(train_loader, cos_threshold=0.9)
+        self.debug_patch_geometry(train_loader, num_examples=5)
+        self.debug_pred_vs_pca_tangent(train_loader, num_examples=5)
         for epoch in range(1, num_epochs + 1):
             train_metrics = self._run_loader(train_loader, train=True, desc=f'train {epoch}/{num_epochs}')
             val_metrics = self._run_loader(val_loader, train=False, desc=f'val   {epoch}/{num_epochs}')
