@@ -229,11 +229,44 @@ class TangentTrainer:
             flush=True,
         )
 
+    def debug_sign_examples(self, loader, num_examples: int = 5):
+        self.model.eval()
+
+        with torch.no_grad():
+            batch = next(iter(loader))
+            batch = self._move_batch(batch)
+            anchor_out, _, _ = self._forward_triplet(batch)
+
+            pred = anchor_out['pred']
+            gt = batch.gt_first_anchor
+
+            pred_n = pred / (pred.norm(dim=-1, keepdim=True) + 1e-8)
+            gt_n = gt / (gt.norm(dim=-1, keepdim=True) + 1e-8)
+
+            cos_pos = torch.sum(pred_n * gt_n, dim=-1)
+            cos_neg = torch.sum(pred_n * (-gt_n), dim=-1)
+
+            print("\n[debug sign examples BEFORE training]")
+            k = min(num_examples, pred.shape[0])
+            for i in range(k):
+                print(f"\nexample {i}")
+                print("anchor_center_index:", int(batch.anchor_center_index[i].item()))
+                print("pred:", pred[i].detach().cpu().numpy())
+                print("gt_first:", gt[i].detach().cpu().numpy())
+                print("cos(pred, gt):", float(cos_pos[i].item()))
+                print("cos(pred, -gt):", float(cos_neg[i].item()))
+                print("pred_norm:", float(pred[i].norm().item()))
+                print("gt_norm:", float(gt[i].norm().item()))
+                print("anchor patch points:")
+                print(batch.anchor[i].detach().cpu().numpy())
+
     def fit(self, train_loader, val_loader, num_epochs, early_stopping_patience=10):
         best_val = float('inf')
         best_epoch = 0
         patience = 0
         best_model_path = self.checkpoint_dir / 'best_model.pt'
+
+        self.debug_sign_examples(train_loader, num_examples=5)
         self.evaluate_once(train_loader, split_name="train_init")
         self.evaluate_once(val_loader, split_name="val_init")
         for epoch in range(1, num_epochs + 1):
