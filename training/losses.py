@@ -35,14 +35,14 @@ class EquivariantVectorLoss(nn.Module):
         self.pred_norm_target = float(pred_norm_target)
 
     def _info_nce(
-        self,
-        pred_anchor_equivariant: torch.Tensor,
-        pred_positive: torch.Tensor,
-        pred_negatives: torch.Tensor,
+            self,
+            pred_anchor_equivariant: torch.Tensor,
+            pred_positive: torch.Tensor,
+            pred_negatives: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = F.normalize(pred_anchor_equivariant, dim=-1)
-        p = F.normalize(pred_positive, dim=-1)
-        n = F.normalize(pred_negatives, dim=-1)
+        q = pred_anchor_equivariant
+        p = pred_positive
+        n = pred_negatives
 
         pos_logits = torch.sum(q * p, dim=-1, keepdim=True) / self.temperature
         neg_logits = torch.einsum('bd,bmd->bm', q, n) / self.temperature
