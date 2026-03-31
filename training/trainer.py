@@ -90,16 +90,13 @@ class TangentTrainer:
         B, M = batch.negatives.shape[:2]
 
         pred_anchor_equivariant = torch.einsum('bd,bed->be', anchor_out['pred'], batch.transform_matrix)
-        proj_anchor_equivariant = anchor_out['projection']
-        proj_positive = positive_out['projection']
-        proj_negatives = neg_out['projection'].view(B, M, -1)
+        pred_positive = positive_out['pred']
+        pred_negatives = neg_out['pred'].view(B, M, -1)
 
         return {
             'pred_anchor_equivariant': pred_anchor_equivariant,
-            'pred_positive': positive_out['pred'],
-            'proj_anchor_equivariant': proj_anchor_equivariant,
-            'proj_positive': proj_positive,
-            'proj_negatives': proj_negatives,
+            'pred_positive': pred_positive,
+            'pred_negatives': pred_negatives,
             'weights': anchor_out['weights'],
         }
 

@@ -28,6 +28,10 @@ def parse_args():
     p.add_argument('--seed', type=int, default=123)
     p.add_argument('--checkpoint-dir', type=str, required=True)
 
+    p.add_argument('--lambda-pred-norm', type=float, default=0.05)
+    p.add_argument('--pred-norm-target', type=float, default=0.25)
+
+
     p.add_argument('--train-source', type=str, default='generated', choices=['generated', 'pregenerated'])
     p.add_argument('--val-source', type=str, default='generated', choices=['generated', 'pregenerated'])
     p.add_argument('--test-source', type=str, default='generated', choices=['generated', 'pregenerated'])
@@ -148,6 +152,8 @@ def main():
         lambda_nce=args.lambda_nce,
         lambda_eq=args.lambda_eq,
         lambda_reg=args.lambda_reg,
+        lambda_pred_norm=args.lambda_pred_norm,
+        pred_norm_target=args.pred_norm_target,
     )
 
     trainer = TangentTrainer(

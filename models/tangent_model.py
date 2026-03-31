@@ -135,6 +135,4 @@ class TangentOperatorModel(nn.Module):
         return {
             'weights': weights,
             'pred': pred,
-            'field_first': field_first,
-            'projection': projection,
         }
