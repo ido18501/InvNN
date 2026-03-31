@@ -389,7 +389,7 @@ class TangentTrainer:
         best_epoch = 0
         patience = 0
         best_model_path = self.checkpoint_dir / 'best_model.pt'
-        torch.save(model.state_dict(), checkpoint_dir / "init_model.pt")
+        torch.save(self.model.state_dict(), self.checkpoint_dir / "init_model.pt")
         for epoch in range(1, num_epochs + 1):
             train_metrics = self._run_loader(train_loader, train=True, desc=f'train {epoch}/{num_epochs}')
             val_metrics = self._run_loader(val_loader, train=False, desc=f'val   {epoch}/{num_epochs}')
