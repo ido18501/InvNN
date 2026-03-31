@@ -319,24 +319,18 @@ def numerical_arc_length_derivatives_on_actual_curve(
     geometry == "similarity":
         uses dense Euclidean arc-length parameter s, estimates x_s, x_ss,
         signed curvature kappa(s), and kappa_s, then converts to
-        similarity-arc-length derivatives:
-            x_sigma   = x_s / kappa
-            x_sigmasigma = x_ss / kappa^2 - (kappa_s / kappa^3) x_s
+        similarity-arc-length derivatives.
 
-        NOTE:
-        This is singular near kappa = 0, so we use similarity_eps to
-        regularize the denominator.
+    geometry == "equiaffine" or "affine":
+        uses the dense Euclidean-arc-length parameter u := s_euc,
+        estimates x_u, x_uu with 5-point finite differences, and converts via
 
-    geometry == "equiaffine":
-        uses the dense Euclidean-arc-length parameter t := s_euc,
-        estimates x_t, x_tt, then converts to equiaffine-arc-length derivatives:
-            phi   = (|det(x_t, x_tt)| + eps)^(1/3)
-            x_s   = x_t / phi
-            x_ss  = x_tt / phi^2 - (phi_t / phi^3) x_t
-        where phi_t is estimated by centered finite differences in t.
+            phi = cbrt(det(x_u, x_uu))
+            x_s   = x_u / phi
+            x_ss  = x_uu / phi^2 - (phi_u / phi^3) x_u
 
-        returns:
-            dx/ds_ea, d²x/ds_ea², dense_anchor_point, ds_euc
+        using the SIGNED cube root so that det(x_s, x_ss) = +1
+        when the local orientation is consistent.
     """
     curve_points = np.asarray(curve_points, dtype=np.float64)
     dense = resample_closed_curve_uniform_arc_length(curve_points, num_points=dense_num_points)
@@ -353,17 +347,23 @@ def numerical_arc_length_derivatives_on_actual_curve(
 
     curr_pt = pt(k)
 
+    # ---------- 5-point finite differences ----------
     def first_second_at(center_idx: int) -> tuple[np.ndarray, np.ndarray]:
-        p_prev = pt(center_idx - 1)
-        p_curr = pt(center_idx)
-        p_next = pt(center_idx + 1)
-        f1 = (p_next - p_prev) / (2.0 * ds)
-        f2 = (p_next - 2.0 * p_curr + p_prev) / (ds ** 2)
+        xm2 = pt(center_idx - 2)
+        xm1 = pt(center_idx - 1)
+        x0  = pt(center_idx)
+        xp1 = pt(center_idx + 1)
+        xp2 = pt(center_idx + 2)
+
+        f1 = (xm2 - 8.0 * xm1 + 8.0 * xp1 - xp2) / (12.0 * ds)
+        f2 = (-xm2 + 16.0 * xm1 - 30.0 * x0 + 16.0 * xp1 - xp2) / (12.0 * ds ** 2)
         return f1, f2
 
+    first_m2, second_m2 = first_second_at(k - 2)
     first_m1, second_m1 = first_second_at(k - 1)
-    first_0, second_0 = first_second_at(k)
+    first_0,  second_0  = first_second_at(k)
     first_p1, second_p1 = first_second_at(k + 1)
+    first_p2, second_p2 = first_second_at(k + 2)
 
     if geometry == "euclidean":
         first = first_0.copy()
@@ -379,7 +379,7 @@ def numerical_arc_length_derivatives_on_actual_curve(
             return det2d(x_s, x_ss) / denom
 
         kappa_m1 = signed_curvature(first_m1, second_m1)
-        kappa_0 = signed_curvature(first_0, second_0)
+        kappa_0  = signed_curvature(first_0,  second_0)
         kappa_p1 = signed_curvature(first_p1, second_p1)
 
         kappa_s = (kappa_p1 - kappa_m1) / (2.0 * ds)
@@ -392,28 +392,34 @@ def numerical_arc_length_derivatives_on_actual_curve(
         first_sim = first_0 / kappa_safe
         second_sim = second_0 / (kappa_safe ** 2) - (kappa_s / (kappa_safe ** 3)) * first_0
 
-        return (
-            first_sim.astype(np.float64),
-            second_sim.astype(np.float64),
-            curr_pt.astype(np.float64),
-            float(ds),
-        )
+        return first_sim.astype(np.float64), second_sim.astype(np.float64), curr_pt.astype(np.float64), float(ds)
 
     if geometry not in ("equiaffine", "affine"):
         raise ValueError(f"Unsupported geometry: {geometry}")
 
+    # ---------- signed cube root version ----------
+    def signed_cuberoot(x: float) -> float:
+        if abs(x) < equiaffine_eps:
+            x = equiaffine_eps if x >= 0.0 else -equiaffine_eps
+        return np.sign(x) * (abs(x) ** (1.0 / 3.0))
+
+    g_m2 = det2d(first_m2, second_m2)
     g_m1 = det2d(first_m1, second_m1)
-    g_0 = det2d(first_0, second_0)
+    g_0  = det2d(first_0,  second_0)
     g_p1 = det2d(first_p1, second_p1)
+    g_p2 = det2d(first_p2, second_p2)
 
-    phi_m1 = (abs(g_m1) + equiaffine_eps) ** (1.0 / 3.0)
-    phi_0 = (abs(g_0) + equiaffine_eps) ** (1.0 / 3.0)
-    phi_p1 = (abs(g_p1) + equiaffine_eps) ** (1.0 / 3.0)
+    phi_m2 = signed_cuberoot(g_m2)
+    phi_m1 = signed_cuberoot(g_m1)
+    phi_0  = signed_cuberoot(g_0)
+    phi_p1 = signed_cuberoot(g_p1)
+    phi_p2 = signed_cuberoot(g_p2)
 
-    phi_t = (phi_p1 - phi_m1) / (2.0 * ds)
+    # 5-point derivative for phi_u
+    phi_u = (phi_m2 - 8.0 * phi_m1 + 8.0 * phi_p1 - phi_p2) / (12.0 * ds)
 
     first_ea = first_0 / phi_0
-    second_ea = second_0 / (phi_0 ** 2) - (phi_t / (phi_0 ** 3)) * first_0
+    second_ea = second_0 / (phi_0 ** 2) - (phi_u / (phi_0 ** 3)) * first_0
 
     return first_ea.astype(np.float64), second_ea.astype(np.float64), curr_pt.astype(np.float64), float(ds)
 

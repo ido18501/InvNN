@@ -79,14 +79,17 @@ class PregeneratedCurveBank:
 
 class TangentDataset(Dataset):
     """
-    Invariant-only dataset with two modes:
+Invariant-only dataset with two modes:
 
-    - source='generated'    : on-the-fly Fourier curves
-    - source='pregenerated' : load curves from a bank on disk
+- source='generated'    : on-the-fly Fourier curves
+- source='pregenerated' : load curves from a bank on disk
 
-    The optimization signal never uses derivatives.
-    Exact analytic Euclidean arc-length derivatives are returned only as diagnostics.
-    """
+The optimization signal never uses derivatives.
+When Fourier coefficients and parameter values are available, family-aware
+analytic arc-length derivatives are returned for diagnostics when supported.
+Otherwise dense geometric fallback derivatives may be returned for debugging,
+with has_analytic_derivatives=False.
+"""
 
     def __init__(
         self,
@@ -109,17 +112,25 @@ class TangentDataset(Dataset):
         negative_min_offset: int = 5,
         negative_max_offset: int = 25,
         negative_other_curve_fraction: float = 0.5,
-        patch_mode: str = 'random_warp_symmetric',
+        patch_mode: str = 'intrinsic_ordered_stencil',
         jitter_fraction: float = 0.25,
         closed: bool = True,
         transform_kwargs: dict[str, Any] | None = None,
         return_centered: bool = True,
         point_noise_std: float = 0.0,
-        warp_sampling_prob: float = 0.7,
-        warp_sampling_strength: float = 0.18,
         dtype: torch.dtype = torch.float32,
         seed: int | None = None,
+        reparametrize_prob: float = 0.7,
+        reparam_strength: float = 0.35,
+        reparam_num_harmonics: int = 3,
+        reparam_min_density: float = 0.35,
+        reparam_max_density: float = 3.0,
     ) -> None:
+        self.reparametrize_prob = reparametrize_prob
+        self.reparam_strength = reparam_strength
+        self.reparam_num_harmonics = reparam_num_harmonics
+        self.reparam_min_density = reparam_min_density
+        self.reparam_max_density = reparam_max_density
         self.length = int(length)
         self.family = family
         self.source = source
@@ -147,8 +158,6 @@ class TangentDataset(Dataset):
         self.transform_kwargs = {} if transform_kwargs is None else dict(transform_kwargs)
         self.return_centered = return_centered
         self.point_noise_std = point_noise_std
-        self.warp_sampling_prob = warp_sampling_prob
-        self.warp_sampling_strength = warp_sampling_strength
         self.dtype = dtype
         self._base_seed = seed
 
@@ -167,27 +176,46 @@ class TangentDataset(Dataset):
         return int(rng.integers(low, high + 1))
 
     def _generate_curve(self, rng: np.random.Generator) -> tuple[Array, BasisExpansionCurveCoeffs, Array]:
-        t = np.linspace(0.0, 2.0 * np.pi, self.num_curve_points, endpoint=False)
-        curve_points, coeffs = generate_random_simple_fourier_curve(
-            t=t,
-            max_freq=self.fourier_max_freq,
-            scale=self.fourier_scale,
-            decay_power=self.fourier_decay_power,
-            rng=rng,
-            max_tries=self.curve_max_tries,
-            center=True,
-            fit_to_canvas=True,
-            min_size=self.curve_min_size,
-            max_size=self.curve_max_size,
-            enforce_simple=False,
-        )
-        if rng.random() < self.warp_sampling_prob:
-            curve_points = warp_curve_sampling(
-                curve_points,
+        use_reparam = rng.random() < self.reparametrize_prob
+
+        if use_reparam:
+            from utils.curve_generation import generate_random_reparameterized_fourier_curve
+
+            curve_points, coeffs, _, t_warped = generate_random_reparameterized_fourier_curve(
+                num_points=self.num_curve_points,
+                max_freq=self.fourier_max_freq,
+                scale=self.fourier_scale,
+                decay_power=self.fourier_decay_power,
                 rng=rng,
-                strength=self.warp_sampling_strength,
-                closed=self.closed,
+                center=True,
+                fit_to_canvas=True,
+                min_size=self.curve_min_size,
+                max_size=self.curve_max_size,
+                reparam_strength=self.reparam_strength,
+                reparam_num_harmonics=self.reparam_num_harmonics,
+                reparam_min_density=self.reparam_min_density,
+                reparam_max_density=self.reparam_max_density,
+                max_tries=self.curve_max_tries,
+                enforce_simple=True,
+                intersection_check_points=max(320, self.num_curve_points // 2),
             )
+            t = t_warped
+        else:
+            t = np.linspace(0.0, 2.0 * np.pi, self.num_curve_points, endpoint=False)
+            curve_points, coeffs = generate_random_simple_fourier_curve(
+                t=t,
+                max_freq=self.fourier_max_freq,
+                scale=self.fourier_scale,
+                decay_power=self.fourier_decay_power,
+                rng=rng,
+                max_tries=self.curve_max_tries,
+                center=True,
+                fit_to_canvas=True,
+                min_size=self.curve_min_size,
+                max_size=self.curve_max_size,
+                enforce_simple=False,
+            )
+
         if self.point_noise_std > 0.0:
             curve_points = curve_points + rng.normal(0.0, self.point_noise_std, size=curve_points.shape)
             curve_points = fit_curve_to_canvas_with_random_size(
@@ -196,19 +224,13 @@ class TangentDataset(Dataset):
                 min_size=self.curve_min_size,
                 max_size=self.curve_max_size,
             )
+
         return curve_points, coeffs, t
 
-    def _load_curve(self, rng: np.random.Generator, idx: int) -> tuple[Array, BasisExpansionCurveCoeffs | None, Array | None]:
+    def _load_curve(self, rng: np.random.Generator, idx: int):
         assert self.bank is not None
         bank_idx = idx % len(self.bank)
         curve_points, coeffs, t_grid = self.bank.get(bank_idx)
-        if rng.random() < self.warp_sampling_prob:
-            curve_points = warp_curve_sampling(
-                curve_points,
-                rng=rng,
-                strength=self.warp_sampling_strength,
-                closed=self.closed,
-            )
         return curve_points, coeffs, t_grid
 
     def _get_curve(self, rng: np.random.Generator, idx: int) -> tuple[Array, BasisExpansionCurveCoeffs | None, Array | None]:
@@ -229,6 +251,8 @@ class TangentDataset(Dataset):
             external_negative_curves.append(ext_curve)
 
         half_width = self._sample_half_width(rng)
+        if self.patch_mode == 'intrinsic_ordered_stencil':
+            half_width = 0
         tuple_sample = build_random_invariant_training_tuple(
             curve_points=curve_points,
             coeffs=coeffs,

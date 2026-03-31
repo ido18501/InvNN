@@ -57,63 +57,50 @@ class TangentTrainer:
     def _derivative_metrics(
         self,
         *,
-        center_first: torch.Tensor,
-        center_second: torch.Tensor,
+        pred: torch.Tensor,
         gt_first: torch.Tensor,
-        gt_second: torch.Tensor,
         has_analytic: torch.Tensor,
     ) -> Dict[str, float]:
-        valid = has_analytic.bool() & torch.isfinite(gt_first).all(dim=-1) & torch.isfinite(gt_second).all(dim=-1)
+        valid = has_analytic.bool() & torch.isfinite(gt_first).all(dim=-1)
         if valid.sum().item() == 0:
             return {
                 'analytic_fraction': 0.0,
                 'first_cosine_mean': float('nan'),
-                'second_cosine_mean': float('nan'),
                 'first_angle_deg_mean': float('nan'),
-                'second_angle_deg_mean': float('nan'),
                 'first_mse': float('nan'),
-                'second_mse': float('nan'),
                 'pred_first_norm_mean': float('nan'),
-                'pred_second_norm_mean': float('nan'),
                 'gt_first_norm_mean': float('nan'),
-                'gt_second_norm_mean': float('nan'),
             }
 
-        center_first = center_first[valid]
-        center_second = center_second[valid]
+        pred = pred[valid]
         gt_first = gt_first[valid]
-        gt_second = gt_second[valid]
 
-        first_cos, first_angle = self._cosine_and_angle(center_first, gt_first)
-        second_cos, second_angle = self._cosine_and_angle(center_second, gt_second)
+        first_cos, first_angle = self._cosine_and_angle(pred, gt_first)
 
         return {
             'analytic_fraction': float(valid.float().mean().item()),
             'first_cosine_mean': float(first_cos.mean().item()),
-            'second_cosine_mean': float(second_cos.mean().item()),
             'first_angle_deg_mean': float(first_angle.mean().item()),
-            'second_angle_deg_mean': float(second_angle.mean().item()),
-            'first_mse': float(torch.mean((center_first - gt_first) ** 2).item()),
-            'second_mse': float(torch.mean((center_second - gt_second) ** 2).item()),
-            'pred_first_norm_mean': float(center_first.norm(dim=-1).mean().item()),
-            'pred_second_norm_mean': float(center_second.norm(dim=-1).mean().item()),
+            'first_mse': float(torch.mean((pred - gt_first) ** 2).item()),
+            'pred_first_norm_mean': float(pred.norm(dim=-1).mean().item()),
             'gt_first_norm_mean': float(gt_first.norm(dim=-1).mean().item()),
-            'gt_second_norm_mean': float(gt_second.norm(dim=-1).mean().item()),
         }
 
     def _build_loss_inputs(self, batch: TangentBatch, anchor_out: dict, positive_out: dict, neg_out: dict) -> dict:
         B, M = batch.negatives.shape[:2]
-        field_anchor_equivariant = self.model.apply_linear_map_to_field(batch.transform_matrix, anchor_out['field_first'])
-        proj_anchor_equivariant = self.model.project_field(field_anchor_equivariant)
-        proj_positive = self.model.project_field(positive_out['field_first'])
-        proj_negatives = self.model.project_field(neg_out['field_first']).view(B, M, -1)
+
+        pred_anchor_equivariant = torch.einsum('bd,bed->be', anchor_out['pred'], batch.transform_matrix)
+        proj_anchor_equivariant = anchor_out['projection']
+        proj_positive = positive_out['projection']
+        proj_negatives = neg_out['projection'].view(B, M, -1)
+
         return {
-            'field_anchor_equivariant': field_anchor_equivariant,
-            'field_positive': positive_out['field_first'],
+            'pred_anchor_equivariant': pred_anchor_equivariant,
+            'pred_positive': positive_out['pred'],
             'proj_anchor_equivariant': proj_anchor_equivariant,
             'proj_positive': proj_positive,
             'proj_negatives': proj_negatives,
-            'operator_matrix': anchor_out['operator'],
+            'weights': anchor_out['weights'],
         }
 
     def train_step(self, batch: TangentBatch) -> TrainOutput:
@@ -133,10 +120,8 @@ class TangentTrainer:
         with torch.no_grad():
             stats.update(
                 self._derivative_metrics(
-                    center_first=anchor_out['center_first'],
-                    center_second=anchor_out['center_second'],
+                    pred=anchor_out['pred'],
                     gt_first=batch.gt_first_anchor,
-                    gt_second=batch.gt_second_anchor,
                     has_analytic=batch.has_analytic_derivatives,
                 )
             )
@@ -151,10 +136,8 @@ class TangentTrainer:
         loss, stats = self.loss_fn(return_stats=True, **loss_inputs)
         stats.update(
             self._derivative_metrics(
-                center_first=anchor_out['center_first'],
-                center_second=anchor_out['center_second'],
+                pred=anchor_out['pred'],
                 gt_first=batch.gt_first_anchor,
-                gt_second=batch.gt_second_anchor,
                 has_analytic=batch.has_analytic_derivatives,
             )
         )
@@ -189,21 +172,15 @@ class TangentTrainer:
             f"nce={train_metrics.get('nce_loss', float('nan')):.4f} "
             f"eqmse={train_metrics.get('eq_raw_loss', float('nan')):.6f} "
             f"eqnorm={train_metrics.get('eq_norm_mse', float('nan')):.6f} "
-            f"sum={train_metrics.get('sum_loss', float('nan')):.6f} "
-            f"reg={train_metrics.get('reg_loss', float('nan')):.6f} "
-            f"loc={train_metrics.get('loc_loss', float('nan')):.6f} "
             f"eqcos={train_metrics.get('eq_cos_mean', float('nan')):.4f} "
-            f"opfro={train_metrics.get('operator_fro_mean', float('nan')):.4f}",
+            f"wnorm={train_metrics.get('weight_l2_mean', float('nan')):.4f}",
             flush=True,
         )
         print(
-            "train emergence | "
+            "train analytic  | "
             f"cos1={train_metrics.get('first_cosine_mean', float('nan')):.4f} "
-            f"cos2={train_metrics.get('second_cosine_mean', float('nan')):.4f} "
             f"ang1={train_metrics.get('first_angle_deg_mean', float('nan')):.2f}° "
-            f"ang2={train_metrics.get('second_angle_deg_mean', float('nan')):.2f}° "
-            f"mse1={train_metrics.get('first_mse', float('nan')):.6f} "
-            f"mse2={train_metrics.get('second_mse', float('nan')):.6f}",
+            f"mse1={train_metrics.get('first_mse', float('nan')):.6f}",
             flush=True,
         )
         print(
@@ -212,21 +189,15 @@ class TangentTrainer:
             f"nce={val_metrics.get('nce_loss', float('nan')):.4f} "
             f"eqmse={val_metrics.get('eq_raw_loss', float('nan')):.6f} "
             f"eqnorm={val_metrics.get('eq_norm_mse', float('nan')):.6f} "
-            f"sum={val_metrics.get('sum_loss', float('nan')):.6f} "
-            f"reg={val_metrics.get('reg_loss', float('nan')):.6f} "
-            f"loc={val_metrics.get('loc_loss', float('nan')):.6f} "
             f"eqcos={val_metrics.get('eq_cos_mean', float('nan')):.4f} "
             f"analytic={val_metrics.get('analytic_fraction', float('nan')):.2f}",
             flush=True,
         )
         print(
-            "val emergence   | "
+            "val   analytic  | "
             f"cos1={val_metrics.get('first_cosine_mean', float('nan')):.4f} "
-            f"cos2={val_metrics.get('second_cosine_mean', float('nan')):.4f} "
             f"ang1={val_metrics.get('first_angle_deg_mean', float('nan')):.2f}° "
-            f"ang2={val_metrics.get('second_angle_deg_mean', float('nan')):.2f}° "
-            f"mse1={val_metrics.get('first_mse', float('nan')):.6f} "
-            f"mse2={val_metrics.get('second_mse', float('nan')):.6f}",
+            f"mse1={val_metrics.get('first_mse', float('nan')):.6f}",
             flush=True,
         )
 
@@ -265,13 +236,10 @@ class TangentTrainer:
         print(f'\n{split_name.capitalize()} metrics', flush=True)
         print(metrics, flush=True)
         print(
-            f"{split_name} emergence | "
+            f"{split_name} analytic | "
             f"cos1={metrics.get('first_cosine_mean', float('nan')):.4f} "
-            f"cos2={metrics.get('second_cosine_mean', float('nan')):.4f} "
             f"ang1={metrics.get('first_angle_deg_mean', float('nan')):.2f}° "
-            f"ang2={metrics.get('second_angle_deg_mean', float('nan')):.2f}° "
-            f"mse1={metrics.get('first_mse', float('nan')):.6f} "
-            f"mse2={metrics.get('second_mse', float('nan')):.6f}",
+            f"mse1={metrics.get('first_mse', float('nan')):.6f}",
             flush=True,
         )
         return metrics

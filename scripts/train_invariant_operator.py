@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from datasets.tangent_dataset import TangentDataset
 from models.tangent_model import TangentOperatorModel
 from training.collate import tangent_collate_fn
-from training.losses import EquivariantMatrixOperatorLoss
+from training.losses import EquivariantVectorLoss
 from training.trainer import TangentTrainer
 
 
@@ -52,11 +52,14 @@ def parse_args():
     p.add_argument('--negative-min-offset', type=int, default=5)
     p.add_argument('--negative-max-offset', type=int, default=25)
     p.add_argument('--negative-other-curve-fraction', type=float, default=0.5)
-    p.add_argument('--patch-mode', type=str, default='random_warp_symmetric')
-    p.add_argument('--jitter-fraction', type=float, default=0.25)
-    p.add_argument('--warp-sampling-prob', type=float, default=0.7)
-    p.add_argument('--warp-sampling-strength', type=float, default=0.18)
-    p.add_argument('--num-curve-points', type=int, default=1000)
+    p.add_argument('--patch-mode', type=str, default='intrinsic_ordered_stencil')
+    p.add_argument('--jitter-fraction', type=float, default=0.0)
+    p.add_argument('--num-curve-points', type=int, default=4000)
+
+    p.add_argument('--reparam-strength', type=float, default=0.15)
+    p.add_argument('--reparam-num-harmonics', type=int, default=2)
+    p.add_argument('--reparam-min-density', type=float, default=0.7)
+    p.add_argument('--reparam-max-density', type=float, default=1.5)
     p.add_argument('--fourier-max-freq', type=int, default=5)
     p.add_argument('--fourier-scale', type=float, default=0.9)
     p.add_argument('--fourier-decay-power', type=float, default=2.0)
@@ -67,18 +70,17 @@ def parse_args():
     p.add_argument('--signature-center-radius', type=int, default=0)
     p.add_argument('--head-dropout', type=float, default=0.0)
     p.add_argument('--disable-normalize-projector', action='store_true')
-    p.add_argument('--disable-center-operator', action='store_true')
     p.add_argument('--disable-centered-input-for-operator', action='store_true')
-    p.add_argument('--operator-bandwidth', type=int, default=None)
     p.add_argument('--operator-init-scale', type=float, default=0.05)
     p.add_argument('--learn-output-scale', action='store_true')
 
     p.add_argument('--temperature', type=float, default=0.1)
     p.add_argument('--lambda-nce', type=float, default=1.0)
     p.add_argument('--lambda-eq', type=float, default=1.0)
-    p.add_argument('--lambda-sum', type=float, default=0.1)
     p.add_argument('--lambda-reg', type=float, default=1e-4)
-    p.add_argument('--lambda-loc', type=float, default=0.0)
+
+
+    p.add_argument('--reparametrize-prob', type=float, default=0.7)
     return p.parse_args()
 
 
@@ -103,18 +105,13 @@ def make_dataset(args, split: str) -> TangentDataset:
         negative_other_curve_fraction=args.negative_other_curve_fraction,
         patch_mode=args.patch_mode,
         jitter_fraction=args.jitter_fraction,
-        warp_sampling_prob=args.warp_sampling_prob,
-        warp_sampling_strength=args.warp_sampling_strength,
         seed=args.seed + {'train': 0, 'val': 10000, 'test': 20000}[split],
+        reparametrize_prob=args.reparametrize_prob,
+        reparam_strength=args.reparam_strength,
+        reparam_num_harmonics=args.reparam_num_harmonics,
+        reparam_min_density=args.reparam_min_density,
+        reparam_max_density=args.reparam_max_density,
     )
-
-
-def build_locality_matrix(patch_size: int) -> torch.Tensor:
-    idx = torch.arange(patch_size, dtype=torch.float32)
-    distance = (idx[:, None] - idx[None, :]).abs()
-    if patch_size <= 1:
-        return torch.zeros((patch_size, patch_size), dtype=torch.float32)
-    return distance / float(patch_size - 1)
 
 
 def main():
@@ -141,25 +138,32 @@ def main():
         signature_center_radius=args.signature_center_radius,
         head_dropout=args.head_dropout,
         normalize_projector=not args.disable_normalize_projector,
-        center_operator=not args.disable_center_operator,
-        operator_bandwidth=args.operator_bandwidth,
         init_scale=args.operator_init_scale,
         learn_scale=args.learn_output_scale,
         centered_input_for_operator=not args.disable_centered_input_for_operator,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = EquivariantMatrixOperatorLoss(
+    loss_fn = EquivariantVectorLoss(
         temperature=args.temperature,
         lambda_nce=args.lambda_nce,
         lambda_eq=args.lambda_eq,
-        lambda_sum=args.lambda_sum,
         lambda_reg=args.lambda_reg,
-        lambda_loc=args.lambda_loc,
-        locality_matrix=build_locality_matrix(args.patch_size),
     )
 
-    trainer = TangentTrainer(model=model, optimizer=optimizer, loss_fn=loss_fn, device=args.device, grad_clip_norm=args.grad_clip_norm, checkpoint_dir=checkpoint_dir)
-    best_model_path = trainer.fit(train_loader=train_loader, val_loader=val_loader, num_epochs=args.num_epochs, early_stopping_patience=args.early_stopping_patience)
+    trainer = TangentTrainer(
+        model=model,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        device=args.device,
+        grad_clip_norm=args.grad_clip_norm,
+        checkpoint_dir=checkpoint_dir,
+    )
+    best_model_path = trainer.fit(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=args.num_epochs,
+        early_stopping_patience=args.early_stopping_patience,
+    )
     print(f'Best model saved at: {best_model_path}')
     trainer.evaluate(test_loader, split_name='test')
 

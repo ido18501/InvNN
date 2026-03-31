@@ -24,40 +24,19 @@ class MLPHead(nn.Module):
 
 
 class TangentOperatorModel(nn.Module):
-    """
-    Predict a KxK operator *per patch*.
-
-    For an input patch X with shape [B, K, 2], the model predicts
-        W(X) in R^{B x K x K}
-    and applies it on the sample-index dimension:
-        Y1 = W(X) X
-        Y2 = W(X) Y1
-
-    The same predicted operator is applied to the x- and y-coordinate channels
-    separately; there is no x/y channel mixing inside W.
-
-    Equivariance is enforced on the *action* of the predicted operator:
-        W(TX) TX  ~=  T(W(X) X)
-    where T(p) = A p + b, and only the linear part A acts on the output field.
-    The translation bias b is intentionally ignored there, just like a true
-    derivative operator would do once row sums are near zero.
-    """
-
     def __init__(
-        self,
-        patch_size: int,
-        *,
-        operator_hidden_dims: list[int] | None = None,
-        signature_hidden_dims: list[int] | None = None,
-        signature_out_dim: int = 64,
-        signature_center_radius: int = 0,
-        head_dropout: float = 0.0,
-        normalize_projector: bool = True,
-        init_scale: float = 0.05,
-        center_operator: bool = True,
-        operator_bandwidth: int | None = None,
-        learn_scale: bool = False,
-        centered_input_for_operator: bool = True,
+            self,
+            patch_size: int,
+            *,
+            operator_hidden_dims: list[int] | None = None,
+            signature_hidden_dims: list[int] | None = None,
+            signature_out_dim: int = 64,
+            signature_center_radius: int = 0,
+            head_dropout: float = 0.0,
+            normalize_projector: bool = True,
+            init_scale: float = 0.05,
+            learn_scale: bool = False,
+            centered_input_for_operator: bool = True,
     ) -> None:
         super().__init__()
         if operator_hidden_dims is None:
@@ -69,23 +48,13 @@ class TangentOperatorModel(nn.Module):
         self.center_index = self.patch_size // 2
         self.signature_center_radius = int(signature_center_radius)
         self.normalize_projector = bool(normalize_projector)
-        self.center_operator = bool(center_operator)
         self.centered_input_for_operator = bool(centered_input_for_operator)
-
-        rows = torch.arange(self.patch_size).view(-1, 1)
-        cols = torch.arange(self.patch_size).view(1, -1)
-        if operator_bandwidth is not None:
-            bw = int(operator_bandwidth)
-            op_mask = ((rows - cols).abs() <= bw).float()
-        else:
-            op_mask = torch.ones(self.patch_size, self.patch_size)
-        self.register_buffer('operator_mask', op_mask)
 
         operator_in_dim = self.patch_size * 2
         self.operator_head = MLPHead(
             in_dim=operator_in_dim,
             hidden_dims=operator_hidden_dims,
-            out_dim=self.patch_size * self.patch_size,
+            out_dim=self.patch_size,
             dropout=head_dropout,
         )
         self.operator_init_scale = float(init_scale)
@@ -113,20 +82,23 @@ class TangentOperatorModel(nn.Module):
             x = x - x.mean(dim=1, keepdim=True)
         return x.reshape(x.shape[0], -1)
 
-    def get_operator(self, x: torch.Tensor) -> torch.Tensor:
+    def get_weights(self, x: torch.Tensor) -> torch.Tensor:
         flat = self._prepare_operator_input(x)
-        op = self.operator_head(flat).view(x.shape[0], self.patch_size, self.patch_size)
-        op = op * self.operator_mask.unsqueeze(0)
-        if self.center_operator:
-            op = op - op.mean(dim=-1, keepdim=True)
-        return op
+        weights = self.operator_head(flat)
+        return weights
 
-    def _apply_operator(self, operator: torch.Tensor, patch: torch.Tensor) -> torch.Tensor:
-        # operator: [B,K,K], patch: [B,K,2] -> [B,K,2]
-        out = torch.einsum('bij,bjd->bid', operator, patch)
+    def apply_weights(self, weights: torch.Tensor, patch: torch.Tensor) -> torch.Tensor:
+        # weights: [B,K], patch: [B,K,2] -> [B,2]
+        out = torch.einsum('bk,bkd->bd', weights, patch)
         if self.output_scale is not None:
             out = self.output_scale * out
         return out
+
+    def vector_to_center_field(self, vectors: torch.Tensor) -> torch.Tensor:
+        # vectors: [B,2] -> [B,K,2]
+        field = vectors.new_zeros(vectors.shape[0], self.patch_size, vectors.shape[-1])
+        field[:, self.center_index, :] = vectors
+        return field
 
     def get_center_vectors(self, field: torch.Tensor) -> torch.Tensor:
         return field[:, self.center_index, :]
@@ -154,18 +126,15 @@ class TangentOperatorModel(nn.Module):
         if x.shape[1] != self.patch_size:
             raise ValueError(f'Expected patch size {self.patch_size}, got {x.shape[1]}')
 
-        operator = self.get_operator(x)
-        field_first = self._apply_operator(operator, x)
-        field_second = self._apply_operator(operator, field_first)
-        center_first = self.get_center_vectors(field_first)
-        center_second = self.get_center_vectors(field_second)
+        weights = self.get_weights(x)
+        pred = self.apply_weights(weights, x)
+
+        field_first = self.vector_to_center_field(pred)
         projection = self.project_field(field_first)
 
         return {
-            'operator': operator,
+            'weights': weights,
+            'pred': pred,
             'field_first': field_first,
-            'field_second': field_second,
-            'center_first': center_first,
-            'center_second': center_second,
             'projection': projection,
         }

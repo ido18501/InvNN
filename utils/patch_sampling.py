@@ -7,7 +7,11 @@ import numpy as np
 
 
 Array = np.ndarray
-PatchSamplingMode = Literal["uniform_symmetric", "random_warp_symmetric"]
+PatchSamplingMode = Literal[
+    "uniform_symmetric",
+    "random_warp_symmetric",
+    "intrinsic_ordered_stencil",
+]
 
 def _sample_random_monotone_profile(
     x: Array,
@@ -144,7 +148,19 @@ def _make_uniform_symmetric_offsets(
         np.linspace(-half_width, half_width, patch_size, endpoint=True)
     ).astype(np.int64)
 
+def _make_intrinsic_ordered_offsets(
+    patch_size: int,
+) -> Array:
+    """
+    Deterministic intrinsic stencil:
+        [-r, ..., -1, 0, 1, ..., r]
+    where r = (patch_size - 1) // 2
+    """
+    if patch_size < 3 or patch_size % 2 == 0:
+        raise ValueError("patch_size must be odd and >= 3.")
 
+    r = patch_size // 2
+    return np.arange(-r, r + 1, dtype=np.int64)
 def _make_random_warp_symmetric_offsets(
     half_width: int,
     patch_size: int,
@@ -252,13 +268,13 @@ def sample_patch_around_index(
             Patch radius in index units: sampled neighbors come from within
             [center_index - half_width, center_index + half_width] along the curve.
         mode:
-            "uniform_symmetric" or "jittered_symmetric".
+            "uniform_symmetric", "random_warp_symmetric", or "intrinsic_ordered_stencil"
         closed:
             Whether the curve should wrap around cyclically.
         rng:
             Optional NumPy random generator.
         jitter_fraction:
-            Amount of jitter relative to nominal spacing for jittered mode.
+            Warp/jitter strength used by random_warp_symmetric mode.
 
     Returns:
         CurvePatchSample
@@ -270,31 +286,41 @@ def sample_patch_around_index(
     num_points = len(curve_points)
     if not (0 <= center_index < num_points):
         raise ValueError("center_index is out of range.")
-    if half_width < 1:
-        raise ValueError("half_width must be at least 1.")
+    if mode != "intrinsic_ordered_stencil":
+        if half_width < 1:
+            raise ValueError("half_width must be at least 1.")
 
-    max_half_width = _compute_max_half_width(
-        num_points=num_points,
-        center_index=center_index,
-        closed=closed,
-    )
-    if half_width > max_half_width:
-        raise ValueError(
-            f"half_width={half_width} is too large for this curve / center_index. "
-            f"Maximum allowed is {max_half_width}."
+        max_half_width = _compute_max_half_width(
+            num_points=num_points,
+            center_index=center_index,
+            closed=closed,
+        )
+        if half_width > max_half_width:
+            raise ValueError(
+                f"half_width={half_width} is too large for this curve / center_index. "
+                f"Maximum allowed is {max_half_width}."
+            )
+
+        if patch_size > 2 * half_width + 1:
+            raise ValueError(
+                "patch_size is too large for the requested half_width. "
+                "Need patch_size <= 2 * half_width + 1 so distinct ordered samples are possible."
+            )
+
+
+
+
+    if mode == "intrinsic_ordered_stencil":
+        relative_offsets = _make_intrinsic_ordered_offsets(
+            patch_size=patch_size,
         )
 
-    if patch_size > 2 * half_width + 1:
-        raise ValueError(
-            "patch_size is too large for the requested half_width. "
-            "Need patch_size <= 2 * half_width + 1 so distinct ordered samples are possible."
-        )
-
-    if mode == "uniform_symmetric":
+    elif mode == "uniform_symmetric":
         relative_offsets = _make_uniform_symmetric_offsets(
             half_width=half_width,
             patch_size=patch_size,
         )
+
     elif mode == "random_warp_symmetric":
         relative_offsets = _make_random_warp_symmetric_offsets(
             half_width=half_width,
@@ -302,6 +328,7 @@ def sample_patch_around_index(
             rng=rng,
             warp_strength=jitter_fraction,
         )
+
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 

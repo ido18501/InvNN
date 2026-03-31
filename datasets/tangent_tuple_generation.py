@@ -8,7 +8,7 @@ from utils.transformations import sample_transformation, apply_transformation
 
 Array = np.ndarray
 
-
+# Anchor patch: sample from the original curve using the requested patch mode
 # -----------------------------
 # Robust GT derivative helper
 # -----------------------------
@@ -118,16 +118,28 @@ def _sample_patch_points(
     rng: np.random.Generator,
     jitter_fraction: float,
 ) -> Array:
-    sample = sample_patch_around_index(
-        curve_points=curve_points,
-        center_index=center_index,
-        patch_size=patch_size,
-        half_width=half_width,
-        mode=mode,
-        closed=closed,
-        rng=rng,
-        jitter_fraction=jitter_fraction,
-    )
+    if mode == "intrinsic_ordered_stencil":
+        sample = sample_patch_around_index(
+            curve_points=curve_points,
+            center_index=center_index,
+            patch_size=patch_size,
+            half_width=0,  # ignored
+            mode=mode,
+            closed=closed,
+            rng=rng,
+            jitter_fraction=0.0,  # ignored
+        )
+    else:
+        sample = sample_patch_around_index(
+            curve_points=curve_points,
+            center_index=center_index,
+            patch_size=patch_size,
+            half_width=half_width,
+            mode=mode,
+            closed=closed,
+            rng=rng,
+            jitter_fraction=jitter_fraction,
+        )
     return _extract_patch_points(sample)
 
 
@@ -272,13 +284,13 @@ def _sample_negative_center_indices(
     patch_mode: str,
     jitter_fraction: float,
     rng: np.random.Generator,
-    min_curvature_gap: float = 0.015,
-    max_tangent_abs_dot: float = 0.995,
-    prefer_close_power: float = 1.20,
-    close_band_min_offset: int = 4,
-    close_band_max_offset: int = 12,
-    mid_band_min_offset: int = 13,
-    mid_band_max_offset: int = 22,
+    min_curvature_gap: float = 0.1,
+    max_tangent_abs_dot: float = 0.9,
+    prefer_close_power=0.6,
+    close_band_min_offset = 20,
+    close_band_max_offset = 75,
+    mid_band_min_offset = 35,
+    mid_band_max_offset = 90,
 ) -> Array:
     """
     Policy:
@@ -390,19 +402,20 @@ def _sample_negative_center_indices(
 
 
 def _compute_anchor_derivatives_with_optional_analytic(
-        curve_points: Array,
-        anchor_index: int,
-        *,
-        coeffs=None,
-        t_grid: Array | None = None,
-        dense_num_points: int = 4096,
+    curve_points,
+    anchor_index,
+    *,
+    family: str,
+    coeffs=None,
+    t_grid=None,
+    dense_num_points=4096,
 ) -> tuple[Array, Array, bool]:
     """
-    Backward-compatible derivative helper.
-
     If Fourier coeffs + anchor parameter value are available, use exact analytic
-    Euclidean arc-length derivatives. Otherwise fall back to the current dense
-    geometric estimate.
+    family-aware arc-length derivatives when supported.
+
+    Otherwise fall back to a dense geometric estimate for debugging only.
+    In fallback mode, has_analytic_derivatives is False.
     """
     if coeffs is not None and t_grid is not None:
         try:
@@ -413,6 +426,7 @@ def _compute_anchor_derivatives_with_optional_analytic(
                 _, first, second = compute_single_anchor_fourier_arc_length_derivatives(
                     t_value=float(t_grid[anchor_index]),
                     coeffs=coeffs,
+                    family=family,
                 )
                 return (
                     np.asarray(first, dtype=np.float64),
@@ -452,7 +466,7 @@ def build_tangent_training_tuple(
     if transform_kwargs is None:
         transform_kwargs = {}
 
-    # Anchor patch: random-warp sampling on original curve
+    # Anchor patch
     anchor_patch = _sample_patch_points(
         curve_points=curve_points,
         center_index=anchor_center_index,
@@ -464,7 +478,7 @@ def build_tangent_training_tuple(
         jitter_fraction=jitter_fraction,
     )
 
-    # Positive patch: transform WHOLE curve, then independently resample again
+    # Positive patch: transform whole curve, then resample patch
     transform = sample_transformation(
         family=transform_family,
         rng=rng,
@@ -498,9 +512,13 @@ def build_tangent_training_tuple(
     )
 
     negative_patches = []
-    num_in_curve = num_negatives - int(num_cross_curve_negatives)
+    num_cross_curve_negatives = int(num_cross_curve_negatives)
+    num_in_curve = max(0, num_negatives - num_cross_curve_negatives)
 
-    for j in neg_idx[:num_in_curve]:
+    # Metadata: -1 means "this negative came from another curve"
+    negative_center_indices = np.full((num_negatives,), -1, dtype=np.int64)
+
+    for slot, j in enumerate(neg_idx[:num_in_curve]):
         neg_patch = _sample_patch_points(
             curve_points=curve_points,
             center_index=int(j),
@@ -512,10 +530,12 @@ def build_tangent_training_tuple(
             jitter_fraction=jitter_fraction,
         )
         negative_patches.append(neg_patch)
+        negative_center_indices[slot] = int(j)
 
     if num_cross_curve_negatives > 0:
         if external_negative_curves is None or len(external_negative_curves) < num_cross_curve_negatives:
             raise ValueError("external_negative_curves missing for requested cross-curve negatives.")
+
         for ext_curve in external_negative_curves[:num_cross_curve_negatives]:
             ext_center = int(rng.integers(0, len(ext_curve)))
             neg_patch = _sample_patch_points(
@@ -530,11 +550,17 @@ def build_tangent_training_tuple(
             )
             negative_patches.append(neg_patch)
 
+    if len(negative_patches) != num_negatives:
+        raise ValueError(
+            f"Expected {num_negatives} negative patches, got {len(negative_patches)}."
+        )
+
     negative_patches = np.stack(negative_patches, axis=0)
 
     gt_first, gt_second, has_analytic_derivatives = _compute_anchor_derivatives_with_optional_analytic(
         curve_points=curve_points,
         anchor_index=anchor_center_index,
+        family=transform_family,
         coeffs=coeffs,
         t_grid=t_grid,
         dense_num_points=gt_dense_num_points,
@@ -547,7 +573,7 @@ def build_tangent_training_tuple(
         negative_patches=negative_patches.astype(np.float32),
         transform_matrix=np.asarray(transform.A, dtype=np.float32),
         anchor_center_index=int(anchor_center_index),
-        negative_center_indices=neg_idx.astype(np.int64),
+        negative_center_indices=negative_center_indices,
         gt_first_anchor=gt_first.astype(np.float32),
         gt_second_anchor=gt_second.astype(np.float32),
         has_analytic_derivatives=has_analytic_derivatives,
@@ -573,7 +599,12 @@ def build_random_tangent_training_tuple(
     t_grid: Array | None = None,
 ) -> TangentTrainingTuple:
     num_points = len(curve_points)
-    valid_center_margin = half_width if not closed else 0
+    if patch_mode == "intrinsic_ordered_stencil":
+        margin = patch_size // 2
+    else:
+        margin = half_width
+
+    valid_center_margin = margin if not closed else 0
 
     if closed:
         anchor_center_index = int(rng.integers(0, num_points))
@@ -616,7 +647,7 @@ def build_random_invariant_training_tuple(
     negative_min_offset: int = 5,
     negative_max_offset: int = 25,
     closed: bool = True,
-    patch_mode: str = "random_warp_symmetric",
+    patch_mode: str = "intrinsic_ordered_stencil",
     jitter_fraction: float = 0.25,
     rng: np.random.Generator | None = None,
     transform_kwargs: dict | None = None,

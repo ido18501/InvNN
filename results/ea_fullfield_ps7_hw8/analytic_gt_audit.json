@@ -1,0 +1,41 @@
+{
+  "available": true,
+  "num_checks": 320,
+  "point_match_error": {
+    "count": 320,
+    "mean": 1.5825625406797672,
+    "std": 0.7224763969777189,
+    "median": 1.515106977313792,
+    "min": 0.19580633370608805,
+    "max": 3.9092942309732237,
+    "p05": 0.6111570179918403,
+    "p25": 1.022368985108051,
+    "p75": 2.044582945867333,
+    "p95": 2.927623236347139
+  },
+  "analytic_first_norm": {
+    "count": 320,
+    "mean": 1.0,
+    "std": 6.538780067061182e-17,
+    "median": 1.0,
+    "min": 0.9999999999999998,
+    "max": 1.0,
+    "p05": 0.9999999999999999,
+    "p25": 0.9999999999999999,
+    "p75": 1.0,
+    "p95": 1.0
+  },
+  "analytic_first_vs_second_cos": {
+    "count": 320,
+    "mean": 5.484452958251162e-16,
+    "std": 1.2726749901998705e-14,
+    "median": 0.0,
+    "min": -3.413275670584811e-14,
+    "max": 2.2306537444330872e-13,
+    "p05": -5.436949000194586e-16,
+    "p25": -1.053369997318578e-16,
+    "p75": 1.2190632648736648e-16,
+    "p95": 1.0123576664759282e-15
+  },
+  "warning": "If point_match_error is not ~0, analytic derivatives do not match the actual sampled curve geometry. That usually means warp/resampling/noise changed the curve after loading coeffs,t_grid."
+}

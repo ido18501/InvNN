@@ -340,3 +340,136 @@ def generate_random_simple_fourier_curve(
         return points, coeffs
 
     raise RuntimeError("Failed to generate a simple non-self-intersecting Fourier curve")
+
+
+def sample_smooth_monotone_periodic_reparameterization(
+    num_points: int,
+    rng: np.random.Generator,
+    strength: float = 0.35,
+    num_harmonics: int = 3,
+    min_density: float = 0.35,
+    max_density: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+        u_grid: uniform target parameter in [0, 2pi), shape (N,)
+        t_warped: warped source parameter values in [0, 2pi), shape (N,)
+    Interpretation:
+        We sample uniformly in u, and evaluate the original curve at t = phi^{-1}(u).
+    """
+    if num_points < 8:
+        raise ValueError("num_points must be at least 8")
+
+    u_grid = np.linspace(0.0, 2.0 * np.pi, num_points, endpoint=False, dtype=np.float64)
+
+    # positive periodic density g(t)
+    g = np.ones_like(u_grid)
+    for k in range(1, num_harmonics + 1):
+        a = rng.normal(0.0, strength / (k ** 1.5))
+        b = rng.normal(0.0, strength / (k ** 1.5))
+        g += a * np.sin(k * u_grid) + b * np.cos(k * u_grid)
+
+    # enforce positivity and avoid extreme distortions
+    g = np.clip(g, min_density, max_density)
+
+    # integrate to build monotone map phi
+    dt = 2.0 * np.pi / num_points
+    phi = np.cumsum(g) * dt
+    phi = phi - phi[0]
+    phi = phi / phi[-1]
+    phi = phi * (2.0 * np.pi)
+
+    # invert phi numerically: for uniform u_grid, find t_warped with phi(t)=u
+    # since phi is monotone, np.interp is enough
+    t_base = u_grid
+    t_warped = np.interp(u_grid, phi, t_base)
+
+    return u_grid, t_warped
+
+
+def generate_random_reparameterized_fourier_curve(
+    num_points: int,
+    max_freq: int = 7,
+    scale: float = 1.0,
+    decay_power: float = 1.65,
+    rng: np.random.Generator | None = None,
+    center: bool = True,
+    fit_to_canvas: bool = True,
+    min_size: float = 0.30,
+    max_size: float = 0.90,
+    reparam_strength: float = 0.35,
+    reparam_num_harmonics: int = 3,
+    reparam_min_density: float = 0.35,
+    reparam_max_density: float = 3.0,
+    max_tries: int = 200,
+    enforce_simple: bool = True,
+    intersection_check_points: int = 320,
+) -> tuple[Array, BasisExpansionCurveCoeffs, Array, Array]:
+    """
+    Returns:
+        curve_points: sampled points x(t_warped)
+        coeffs
+        u_grid: uniform target parameter
+        t_warped: actual source parameter values used for evaluation
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    basis_functions = make_fourier_basis_functions(max_freq)
+    coeff_std = make_fourier_coeff_std(max_freq=max_freq, scale=scale, decay_power=decay_power)
+
+    num_attempts = max_tries if enforce_simple else 1
+
+    for _ in range(num_attempts):
+        coeffs = generate_random_basis_expansion_coeffs(
+            num_basis_functions=len(basis_functions),
+            coeff_std=coeff_std,
+            rng=rng,
+        )
+
+        # First check the underlying geometric curve on a dense uniform grid
+        t_dense = np.linspace(0.0, 2.0 * np.pi, max(num_points, intersection_check_points), endpoint=False)
+        dense_points = evaluate_basis_expansion_curve(t_dense, basis_functions, coeffs)
+
+        if center:
+            dense_points = center_curve(dense_points)
+
+        if enforce_simple and not _simple_closed_screen(
+            dense_points,
+            intersection_check_points=intersection_check_points,
+        ):
+            continue
+
+        # Now apply monotone reparameterization
+        u_grid, t_warped = sample_smooth_monotone_periodic_reparameterization(
+            num_points=num_points,
+            rng=rng,
+            strength=reparam_strength,
+            num_harmonics=reparam_num_harmonics,
+            min_density=reparam_min_density,
+            max_density=reparam_max_density,
+        )
+
+        points = evaluate_basis_expansion_curve(t_warped, basis_functions, coeffs)
+
+        if center:
+            points = center_curve(points)
+
+        # Optional safety check on the sampled polygon after reparameterization
+        if enforce_simple and not _simple_closed_screen(
+            points,
+            intersection_check_points=min(intersection_check_points, num_points),
+        ):
+            continue
+
+        if fit_to_canvas:
+            points = fit_curve_to_canvas_with_random_size(
+                points,
+                rng=rng,
+                min_size=min_size,
+                max_size=max_size,
+            )
+
+        return points, coeffs, u_grid, t_warped
+
+    raise RuntimeError("Failed to generate a simple non-self-intersecting reparameterized Fourier curve")
