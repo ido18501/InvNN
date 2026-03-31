@@ -94,42 +94,29 @@ class TangentTrainer:
 
         with torch.no_grad():
             for batch in loader:
-                batch = batch.to(self.device)
+                batch = self._move_batch(batch)
 
-                anchor_out = self.model(batch.anchor)
-                positive_out = self.model(batch.positive)
-                negatives = batch.negatives.view(-1, *batch.negatives.shape[2:])
-                neg_out = self.model(negatives)
-
+                anchor_out, positive_out, neg_out = self._forward_triplet(batch)
                 loss_inputs = self._build_loss_inputs(batch, anchor_out, positive_out, neg_out)
+                _, stats = self.loss_fn(return_stats=True, **loss_inputs)
 
-                _, stats = self.loss_fn(**loss_inputs, return_stats=True)
-
-                # analytic stats (reuse your existing logic)
-                if batch.has_analytic_derivatives.any():
-                    mask = batch.has_analytic_derivatives.bool()
-                    pred = anchor_out['pred'][mask]
-                    gt = batch.gt_first_anchor[mask]
-
-                    cos = torch.nn.functional.cosine_similarity(pred, gt, dim=-1)
-                    ang = torch.acos(torch.clamp(cos, -1.0, 1.0)) * 180.0 / 3.1415926535
-                    mse = ((pred - gt) ** 2).mean(dim=-1)
-
-                    stats.update({
-                        'first_cosine_mean': float(cos.mean().item()),
-                        'first_angle_deg_mean': float(ang.mean().item()),
-                        'first_mse': float(mse.mean().item()),
-                        'pred_first_norm_mean': float(pred.norm(dim=-1).mean().item()),
-                        'gt_first_norm_mean': float(gt.norm(dim=-1).mean().item()),
-                    })
+                stats.update(
+                    self._derivative_metrics(
+                        pred=anchor_out['pred'],
+                        gt_first=batch.gt_first_anchor,
+                        has_analytic=batch.has_analytic_derivatives,
+                    )
+                )
 
                 for k, v in stats.items():
-                    total[k] = total.get(k, 0.0) + v
+                    if isinstance(v, float) and (v != v):
+                        continue
+                    total[k] = total.get(k, 0.0) + float(v)
                 count += 1
 
         print(f"\n[{split_name} evaluation BEFORE training]")
         for k in sorted(total.keys()):
-            print(f"{k}: {total[k] / count:.6f}")
+            print(f"{k}: {total[k] / max(count, 1):.6f}")
     def _build_loss_inputs(self, batch: TangentBatch, anchor_out: dict, positive_out: dict, neg_out: dict) -> dict:
         B, M = batch.negatives.shape[:2]
 
@@ -247,8 +234,8 @@ class TangentTrainer:
         best_epoch = 0
         patience = 0
         best_model_path = self.checkpoint_dir / 'best_model.pt'
-        self.evaluate_once(self.train_loader, split_name="train_init")
-        self.evaluate_once(self.val_loader, split_name="val_init")
+        self.evaluate_once(train_loader, split_name="train_init")
+        self.evaluate_once(val_loader, split_name="val_init")
         for epoch in range(1, num_epochs + 1):
             train_metrics = self._run_loader(train_loader, train=True, desc=f'train {epoch}/{num_epochs}')
             val_metrics = self._run_loader(val_loader, train=False, desc=f'val   {epoch}/{num_epochs}')
