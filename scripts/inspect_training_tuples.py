@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fourier-max-freq", type=int, default=7)
     p.add_argument("--fourier-scale", type=float, default=1.0)
     p.add_argument("--fourier-decay-power", type=float, default=1.65)
-    p.add_argument("--curve-max-tries", type=int, default=300)
+    p.add_argument("--curve-max-tries", type=int, default=10000)
     p.add_argument("--curve-min-size", type=float, default=0.45)
     p.add_argument("--curve-max-size", type=float, default=0.75)
     p.add_argument("--reparametrize-prob", type=float, default=0.7)
@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reparam-min-density", type=float, default=0.7)
     p.add_argument("--reparam-max-density", type=float, default=1.5)
     p.add_argument("--seed", type=int, default=123)
+    p.add_argument("--downsample-to-points", type=int, default=None)
+    p.add_argument("--downsample-jitter", type=float, default=0.2)
     return p.parse_args()
 
 
@@ -140,10 +142,31 @@ def plot_full_curve(ax, curve: np.ndarray, center_idx: int, neg_idxs: np.ndarray
 
 
 def plot_context_and_stencil(ax, context: np.ndarray, patch: np.ndarray, title: str) -> None:
-    ax.plot(context[:, 0], context[:, 1], linewidth=1.2, alpha=0.8)
-    ax.plot(patch[:, 0], patch[:, 1], marker="o", markersize=4, linewidth=2.0)
+    # show context faintly
+    ax.plot(context[:, 0], context[:, 1], linewidth=1.0, alpha=0.35)
+
+    # show stencil clearly
+    ax.plot(patch[:, 0], patch[:, 1], color="orange", marker="o", markersize=5, linewidth=2.5)
     c = len(patch) // 2
-    ax.scatter([patch[c, 0]], [patch[c, 1]], s=50, marker="x")
+    ax.scatter([patch[c, 0]], [patch[c, 1]], color="red", s=55, marker="x")
+
+    # zoom around stencil, not full context
+    xmin, xmax = patch[:, 0].min(), patch[:, 0].max()
+    ymin, ymax = patch[:, 1].min(), patch[:, 1].max()
+
+    dx = xmax - xmin
+    dy = ymax - ymin
+    span = max(dx, dy, 1e-6)
+
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+
+    zoom = 0.8   # smaller => tighter zoom, larger => more context around patch
+    half = 0.5 * zoom * span
+
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+
     ax.set_aspect("equal")
     ax.set_title(title, fontsize=9)
     ax.axis("off")

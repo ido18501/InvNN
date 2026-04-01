@@ -1,0 +1,21 @@
+{
+  "num_curves": 750,
+  "num_points": 250,
+  "max_freq": 20,
+  "scale": 1.0,
+  "decay_power": 1.35,
+  "min_size": 0.45,
+  "max_size": 0.75,
+  "max_tries": 10000,
+  "intersection_check_points": 320,
+  "seed": 456,
+  "reparametrize_prob": 0.85,
+  "reparam_strength": 0.15,
+  "reparam_num_harmonics": 2,
+  "reparam_min_density": 0.7,
+  "reparam_max_density": 1.5,
+  "downsample_to_points": 180,
+  "downsample_jitter": 0.2,
+  "actual_intersection_check_points": 320,
+  "reparam_fraction_realized": 0.8253333333333334
+}

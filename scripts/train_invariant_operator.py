@@ -83,6 +83,9 @@ def parse_args():
     p.add_argument('--lambda-eq', type=float, default=1.0)
     p.add_argument('--lambda-reg', type=float, default=1e-4)
 
+    p.add_argument('--downsample-to-points', type=int, default=None)
+    p.add_argument('--downsample-jitter', type=float, default=0.2)
+
 
     p.add_argument('--reparametrize-prob', type=float, default=0.7)
     return p.parse_args()
@@ -115,6 +118,8 @@ def make_dataset(args, split: str) -> TangentDataset:
         reparam_num_harmonics=args.reparam_num_harmonics,
         reparam_min_density=args.reparam_min_density,
         reparam_max_density=args.reparam_max_density,
+        downsample_to_points=args.downsample_to_points,
+        downsample_jitter=args.downsample_jitter,
     )
 
 

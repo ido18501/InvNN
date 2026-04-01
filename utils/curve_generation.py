@@ -386,6 +386,72 @@ def sample_smooth_monotone_periodic_reparameterization(
 
     return u_grid, t_warped
 
+def sample_bounded_stride_indices(
+    n_in: int,
+    n_out: int,
+    rng: np.random.Generator,
+    jitter: float = 0.2,
+) -> np.ndarray:
+    if n_out <= 0:
+        raise ValueError("n_out must be positive")
+    if n_in <= 0:
+        raise ValueError("n_in must be positive")
+    if n_out >= n_in:
+        return np.arange(n_in, dtype=np.int64)
+
+    stride = n_in / n_out
+    min_step = max(1, int(np.floor(stride * (1.0 - jitter))))
+    max_step = max(min_step, int(np.ceil(stride * (1.0 + jitter))))
+
+    idxs = [0]
+    cur = 0
+
+    while True:
+        remaining_slots = n_out - len(idxs)
+        if remaining_slots == 0:
+            break
+
+        remaining_points = (n_in - 1) - cur
+
+        # latest step allowed so we can still finish
+        latest = remaining_points - max(0, remaining_slots - 1) * min_step
+        # earliest step allowed so we do not finish too early
+        earliest = max(min_step, remaining_points - max(0, remaining_slots - 1) * max_step)
+
+        lo = max(min_step, earliest)
+        hi = min(max_step, latest)
+
+        if lo > hi:
+            # deterministic fallback
+            step = max(1, remaining_points // remaining_slots)
+        else:
+            step = int(rng.integers(lo, hi + 1))
+
+        cur += step
+        idxs.append(cur)
+
+    idxs = np.asarray(idxs, dtype=np.int64)
+
+    if len(idxs) != n_out:
+        raise RuntimeError(f"Expected {n_out} indices, got {len(idxs)}")
+
+    if np.any(np.diff(idxs) <= 0):
+        raise RuntimeError("Downsample indices are not strictly increasing")
+
+    if idxs[0] < 0 or idxs[-1] >= n_in:
+        raise RuntimeError("Downsample indices out of bounds")
+
+    return idxs
+
+
+def downsample_with_bounded_stride(
+    points: Array,
+    num_out: int,
+    rng: np.random.Generator,
+    jitter: float = 0.2,
+) -> tuple[Array, np.ndarray]:
+    idxs = sample_bounded_stride_indices(len(points), num_out, rng=rng, jitter=jitter)
+    return points[idxs], idxs
 
 def generate_random_reparameterized_fourier_curve(
     num_points: int,
@@ -401,9 +467,11 @@ def generate_random_reparameterized_fourier_curve(
     reparam_num_harmonics: int = 3,
     reparam_min_density: float = 0.35,
     reparam_max_density: float = 3.0,
-    max_tries: int = 200,
+    max_tries: int = 1000,
     enforce_simple: bool = True,
     intersection_check_points: int = 320,
+    downsample_to_points: int | None = None,
+    downsample_jitter: float = 0.2,
 ) -> tuple[Array, BasisExpansionCurveCoeffs, Array, Array]:
     """
     Returns:
@@ -451,6 +519,16 @@ def generate_random_reparameterized_fourier_curve(
         )
 
         points = evaluate_basis_expansion_curve(t_warped, basis_functions, coeffs)
+        if downsample_to_points is not None and downsample_to_points < len(points):
+            idxs = sample_bounded_stride_indices(
+                len(points),
+                downsample_to_points,
+                rng=rng,
+                jitter=downsample_jitter,
+            )
+            points = points[idxs]
+            u_grid = u_grid[idxs]
+            t_warped = t_warped[idxs]
 
         if center:
             points = center_curve(points)
@@ -473,3 +551,4 @@ def generate_random_reparameterized_fourier_curve(
         return points, coeffs, u_grid, t_warped
 
     raise RuntimeError("Failed to generate a simple non-self-intersecting reparameterized Fourier curve")
+

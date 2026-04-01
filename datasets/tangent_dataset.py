@@ -125,7 +125,11 @@ with has_analytic_derivatives=False.
         reparam_num_harmonics: int = 3,
         reparam_min_density: float = 0.35,
         reparam_max_density: float = 3.0,
+        downsample_to_points: int | None = None,
+        downsample_jitter: float = 0.2,
     ) -> None:
+        self.downsample_to_points = downsample_to_points
+        self.downsample_jitter = downsample_jitter
         self.reparametrize_prob = reparametrize_prob
         self.reparam_strength = reparam_strength
         self.reparam_num_harmonics = reparam_num_harmonics
@@ -198,6 +202,8 @@ with has_analytic_derivatives=False.
                 max_tries=self.curve_max_tries,
                 enforce_simple=True,
                 intersection_check_points=max(320, self.num_curve_points // 2),
+                downsample_to_points=self.downsample_to_points,
+                downsample_jitter=self.downsample_jitter,
             )
             t = t_warped
         else:

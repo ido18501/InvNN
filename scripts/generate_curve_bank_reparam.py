@@ -13,6 +13,7 @@ import numpy as np
 from utils.curve_generation import (
     generate_random_reparameterized_fourier_curve,
     generate_random_simple_fourier_curve,
+    sample_bounded_stride_indices,
 )
 
 
@@ -33,6 +34,8 @@ class CurveGenConfig:
     reparam_num_harmonics: int
     reparam_min_density: float
     reparam_max_density: float
+    downsample_to_points: int | None
+    downsample_jitter: float
 
 
 def _generate_one(
@@ -61,9 +64,12 @@ def _generate_one(
             max_tries=cfg.max_tries,
             enforce_simple=True,
             intersection_check_points=cfg.intersection_check_points,
+            downsample_to_points=cfg.downsample_to_points,
+            downsample_jitter=cfg.downsample_jitter,
         )
-        t_grid = np.asarray(t_warped, dtype=np.float32)
+        t_grid = np.asarray(t_warped, dtype=np.float64)
         was_reparam = np.int32(1)
+
     else:
         t_uniform = np.linspace(0.0, 2.0 * np.pi, cfg.num_points, endpoint=False, dtype=np.float64)
         curve_points, coeffs = generate_random_simple_fourier_curve(
@@ -80,14 +86,24 @@ def _generate_one(
             enforce_simple=True,
             intersection_check_points=cfg.intersection_check_points,
         )
-        t_grid = t_uniform.astype(np.float32)
+        t_grid = t_uniform
         was_reparam = np.int32(0)
+
+        if cfg.downsample_to_points is not None and cfg.downsample_to_points < len(curve_points):
+            idxs = sample_bounded_stride_indices(
+                len(curve_points),
+                cfg.downsample_to_points,
+                rng=rng,
+                jitter=cfg.downsample_jitter,
+            )
+            curve_points = curve_points[idxs]
+            t_grid = t_grid[idxs]
 
     return (
         curve_points.astype(np.float32),
         coeffs.x_coeffs.astype(np.float32),
         coeffs.y_coeffs.astype(np.float32),
-        t_grid,
+        t_grid.astype(np.float32),
         was_reparam,
     )
 
@@ -162,6 +178,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preview-png", type=str, default="")
     p.add_argument("--preview-count", type=int, default=20)
     p.add_argument("--preview-point-stride", type=int, default=25)
+    p.add_argument("--downsample-to-points", type=int, default=None)
+    p.add_argument("--downsample-jitter", type=float, default=0.2)
 
     return p.parse_args()
 
@@ -191,13 +209,14 @@ def main() -> None:
         reparam_num_harmonics=args.reparam_num_harmonics,
         reparam_min_density=args.reparam_min_density,
         reparam_max_density=args.reparam_max_density,
+        downsample_to_points=args.downsample_to_points,
+        downsample_jitter=args.downsample_jitter,
     )
 
     work_items = [(i, cfg) for i in range(cfg.num_curves)]
 
     with mp.get_context("spawn").Pool(processes=args.workers) as pool:
         results = pool.map(_generate_one, work_items)
-
     curves = np.stack([r[0] for r in results], axis=0)
     x_coeffs = np.stack([r[1] for r in results], axis=0)
     y_coeffs = np.stack([r[2] for r in results], axis=0)
