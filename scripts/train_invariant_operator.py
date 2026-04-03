@@ -88,6 +88,7 @@ def parse_args():
 
 
     p.add_argument('--reparametrize-prob', type=float, default=0.7)
+    p.add_argument('--disable-return-centered', action='store_true')
     return p.parse_args()
 
 
@@ -119,6 +120,7 @@ def make_dataset(args, split: str) -> TangentDataset:
         reparam_min_density=args.reparam_min_density,
         reparam_max_density=args.reparam_max_density,
         downsample_to_points=args.downsample_to_points,
+        return_centered=not args.disable_return_centered,
         downsample_jitter=args.downsample_jitter,
     )
 
