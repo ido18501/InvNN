@@ -17,9 +17,10 @@ class TrainOutput:
 
 
 class TangentTrainer:
-    def __init__(self, model, optimizer, loss_fn, device, grad_clip_norm=None, checkpoint_dir='checkpoints'):
+    def __init__(self, model, optimizer, scheduler, loss_fn, device, grad_clip_norm=None, checkpoint_dir='checkpoints'):
         self.model = model
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.loss_fn = loss_fn
         self.device = torch.device(device)
         self.grad_clip_norm = grad_clip_norm
@@ -395,6 +396,10 @@ class TangentTrainer:
             val_metrics = self._run_loader(val_loader, train=False, desc=f'val   {epoch}/{num_epochs}')
             val_loss = val_metrics.get('loss', float('inf'))
             self._print_epoch_summary(epoch, train_metrics, val_metrics)
+            if self.scheduler is not None:
+                self.scheduler.step(val_metrics['loss'])
+                current_lr = self.optimizer.param_groups[0]['lr']
+                print(f"lr={current_lr:.6g}", flush=True)
 
             if val_loss < best_val:
                 best_val = val_loss

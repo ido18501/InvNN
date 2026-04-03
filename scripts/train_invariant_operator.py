@@ -89,6 +89,11 @@ def parse_args():
 
     p.add_argument('--reparametrize-prob', type=float, default=0.7)
     p.add_argument('--disable-return-centered', action='store_true')
+
+    p.add_argument('--lr-scheduler', type=str, default='plateau', choices=['none', 'plateau'])
+    p.add_argument('--lr-patience', type=int, default=4)
+    p.add_argument('--lr-factor', type=float, default=0.3)
+    p.add_argument('--lr-min', type=float, default=1e-5)
     return p.parse_args()
 
 
@@ -154,6 +159,15 @@ def main():
         centered_input_for_operator=not args.disable_centered_input_for_operator,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = None
+    if args.lr_scheduler == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+            min_lr=args.lr_min,
+        )
     loss_fn = EquivariantVectorLoss(
         temperature=args.temperature,
         lambda_nce=args.lambda_nce,
@@ -166,6 +180,7 @@ def main():
     trainer = TangentTrainer(
         model=model,
         optimizer=optimizer,
+        scheduler=scheduler,
         loss_fn=loss_fn,
         device=args.device,
         grad_clip_norm=args.grad_clip_norm,
