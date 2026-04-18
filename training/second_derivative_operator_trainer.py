@@ -1,0 +1,356 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import json
+import math
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
+
+from datasets.tangent_dataset import PregeneratedCurveBank
+from utils.derivatives import compute_fourier_arc_length_derivatives
+
+
+class FullCurveSecondDerivativeDataset(Dataset):
+    """
+    Full-curve dataset for direct second-derivative operator learning.
+    Uses only PregeneratedCurveBank and analytic arc-length derivatives.
+    """
+
+    def __init__(self, bank_path: str | Path, family: str = 'euclidean', dtype: torch.dtype = torch.float32) -> None:
+        self.bank = PregeneratedCurveBank(bank_path)
+        self.family = str(family)
+        self.dtype = dtype
+
+    def __len__(self) -> int:
+        return len(self.bank)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | int]:
+        curve_points, coeffs, t_grid = self.bank.get(idx)
+        if coeffs is None or t_grid is None:
+            raise RuntimeError('Direct second-derivative training requires coeffs and t_grid in the pregenerated bank.')
+
+        _, gt_first, gt_second = compute_fourier_arc_length_derivatives(
+            t=np.asarray(t_grid, dtype=np.float64),
+            coeffs=coeffs,
+            family=self.family,
+        )
+        return {
+            'curve_points': torch.as_tensor(curve_points, dtype=self.dtype),
+            'gt_first': torch.as_tensor(gt_first, dtype=self.dtype),
+            'gt_second': torch.as_tensor(gt_second, dtype=self.dtype),
+            'curve_index': int(idx),
+        }
+
+
+@dataclass
+class CurveBatch:
+    curve_points: torch.Tensor
+    gt_first: torch.Tensor
+    gt_second: torch.Tensor
+    curve_index: torch.Tensor
+
+
+def full_curve_collate(batch: list[dict]) -> CurveBatch:
+    return CurveBatch(
+        curve_points=torch.stack([x['curve_points'] for x in batch], dim=0),
+        gt_first=torch.stack([x['gt_first'] for x in batch], dim=0),
+        gt_second=torch.stack([x['gt_second'] for x in batch], dim=0),
+        curve_index=torch.tensor([x['curve_index'] for x in batch], dtype=torch.long),
+    )
+
+
+@dataclass
+class EvalSummary:
+    metrics: dict[str, float]
+    raw: dict[str, np.ndarray]
+
+
+class SecondDerivativeOperatorTrainer:
+    def __init__(
+        self,
+        *,
+        model,
+        optimizer,
+        scheduler,
+        loss_fn,
+        device: str | torch.device,
+        checkpoint_dir: str | Path,
+        patch_size: int,
+        grad_clip_norm: float | None = 1.0,
+        train_num_anchors: int = 128,
+    ) -> None:
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.loss_fn = loss_fn
+        self.device = torch.device(device)
+        self.patch_size = int(patch_size)
+        self.radius = self.patch_size // 2
+        self.grad_clip_norm = grad_clip_norm
+        self.train_num_anchors = int(train_num_anchors)
+
+        self.model.to(self.device)
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def _move_batch(self, batch: CurveBatch) -> CurveBatch:
+        batch.curve_points = batch.curve_points.to(self.device)
+        batch.gt_first = batch.gt_first.to(self.device)
+        batch.gt_second = batch.gt_second.to(self.device)
+        batch.curve_index = batch.curve_index.to(self.device)
+        return batch
+
+    @staticmethod
+    def _sample_anchor_indices(num_points: int, num_anchors: int, device: torch.device, generator: torch.Generator) -> torch.Tensor:
+        if num_anchors >= num_points:
+            return torch.arange(num_points, device=device, dtype=torch.long)
+        perm = torch.randperm(num_points, generator=generator, device=device)
+        return perm[:num_anchors]
+
+    def _cyclic_gather_patches(self, curve_points: torch.Tensor, center_indices: torch.Tensor) -> torch.Tensor:
+        offsets = torch.arange(-self.radius, self.radius + 1, device=curve_points.device, dtype=torch.long)
+        idx = (center_indices[:, None] + offsets[None, :]) % curve_points.shape[0]
+        return curve_points[idx]
+
+    def _effective_weights(self, model_out: dict[str, torch.Tensor]) -> torch.Tensor:
+        weights = model_out['weights']
+        scale = getattr(self.model, 'output_scale', None)
+        if scale is None:
+            return weights
+        return scale * weights
+
+    def _predict_direct_second(self, curve_points: torch.Tensor, center_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        patches = self._cyclic_gather_patches(curve_points, center_indices)
+        out = self.model(patches)
+        effective_weights = self._effective_weights(out)
+        pred2 = torch.einsum('mk,mkd->md', effective_weights, patches)
+        return pred2, effective_weights
+
+    @staticmethod
+    def _cosine_and_angle(pred: np.ndarray, gt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pred_n = pred / np.clip(np.linalg.norm(pred, axis=-1, keepdims=True), 1e-8, None)
+        gt_n = gt / np.clip(np.linalg.norm(gt, axis=-1, keepdims=True), 1e-8, None)
+        cos = np.sum(pred_n * gt_n, axis=-1)
+        cos = np.clip(cos, -1.0, 1.0)
+        angle = np.degrees(np.arccos(cos))
+        return cos, angle
+
+    @staticmethod
+    def _pearson(x: np.ndarray, y: np.ndarray) -> float:
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        if x.size < 2 or y.size < 2:
+            return float('nan')
+        x = x - x.mean()
+        y = y - y.mean()
+        denom = np.linalg.norm(x) * np.linalg.norm(y)
+        if denom <= 1e-12:
+            return float('nan')
+        return float(np.dot(x, y) / denom)
+
+    @staticmethod
+    def _rankdata_average(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        order = np.argsort(x, kind='mergesort')
+        ranks = np.empty_like(order, dtype=np.float64)
+        xs = x[order]
+        start = 0
+        while start < len(x):
+            end = start + 1
+            while end < len(x) and xs[end] == xs[start]:
+                end += 1
+            avg_rank = 0.5 * (start + end - 1) + 1.0
+            ranks[order[start:end]] = avg_rank
+            start = end
+        return ranks
+
+    def _spearman(self, x: np.ndarray, y: np.ndarray) -> float:
+        return self._pearson(self._rankdata_average(x), self._rankdata_average(y))
+
+    def _vector_metrics(self, pred: np.ndarray, gt: np.ndarray, prefix: str) -> dict[str, float]:
+        cos, angle = self._cosine_and_angle(pred, gt)
+        pred_norm = np.linalg.norm(pred, axis=-1)
+        gt_norm = np.linalg.norm(gt, axis=-1)
+        norm_err = np.abs(pred_norm - gt_norm)
+        out = {
+            f'{prefix}_cosine_mean': float(np.mean(cos)),
+            f'{prefix}_abs_cosine_mean': float(np.mean(np.abs(cos))),
+            f'{prefix}_angle_mean': float(np.mean(angle)),
+            f'{prefix}_mse': float(np.mean((pred - gt) ** 2)),
+            f'{prefix}_pred_norm_mean': float(np.mean(pred_norm)),
+            f'{prefix}_pred_norm_median': float(np.median(pred_norm)),
+            f'{prefix}_norm_error_mean': float(np.mean(norm_err)),
+            f'{prefix}_norm_error_median': float(np.median(norm_err)),
+            f'{prefix}_norm_spearman': self._spearman(pred_norm, gt_norm),
+            f'{prefix}_norm_pearson': self._pearson(pred_norm, gt_norm),
+            f'{prefix}_log1p_norm_pearson': self._pearson(np.log1p(pred_norm), np.log1p(gt_norm)),
+        }
+        if pred_norm.size >= 2 and np.std(gt_norm) > 1e-12:
+            slope, intercept = np.polyfit(gt_norm, pred_norm, deg=1)
+            out[f'{prefix}_norm_fit_slope'] = float(slope)
+            out[f'{prefix}_norm_fit_intercept'] = float(intercept)
+        else:
+            out[f'{prefix}_norm_fit_slope'] = float('nan')
+            out[f'{prefix}_norm_fit_intercept'] = float('nan')
+        return out
+
+    def _full_evaluate_loader(self, loader: DataLoader, split_name: str, tag: str) -> EvalSummary:
+        self.model.eval()
+        direct2_pred, gt2_all = [], []
+        with torch.no_grad():
+            for batch in tqdm(loader, desc=f'{split_name} {tag}', leave=False, dynamic_ncols=True):
+                batch = self._move_batch(batch)
+                bsz = batch.curve_points.shape[0]
+                for b in range(bsz):
+                    n = batch.curve_points[b].shape[0]
+                    all_idx = torch.arange(n, device=self.device, dtype=torch.long)
+                    pred2, _ = self._predict_direct_second(batch.curve_points[b], all_idx)
+                    direct2_pred.append(pred2.detach().cpu().numpy())
+                    gt2_all.append(batch.gt_second[b].detach().cpu().numpy())
+        direct2_pred = np.concatenate(direct2_pred, axis=0)
+        gt2_all = np.concatenate(gt2_all, axis=0)
+        metrics = self._vector_metrics(direct2_pred, gt2_all, 'direct2')
+        return EvalSummary(metrics=metrics, raw={'direct2_pred': direct2_pred, 'gt2': gt2_all})
+
+    def train_one_epoch(self, loader: DataLoader, epoch: int, num_epochs: int, seed: int) -> dict[str, float]:
+        self.model.train()
+        metrics: dict[str, float] = {}
+        count = 0
+        gen = torch.Generator(device=self.device.type if self.device.type != 'mps' else 'cpu')
+        gen.manual_seed(seed + epoch)
+
+        iterator = tqdm(loader, desc=f'train {epoch}/{num_epochs}', leave=False, dynamic_ncols=True)
+        for batch in iterator:
+            batch = self._move_batch(batch)
+            self.optimizer.zero_grad(set_to_none=True)
+
+            total_loss = batch.curve_points.new_zeros(())
+            batch_stats_accum: dict[str, float] = {}
+            bsz = batch.curve_points.shape[0]
+            for b in range(bsz):
+                n = batch.curve_points.shape[1]
+                anchor_idx = self._sample_anchor_indices(n, self.train_num_anchors, self.device, gen)
+                pred2, eff_w = self._predict_direct_second(batch.curve_points[b], anchor_idx)
+                gt2 = batch.gt_second[b, anchor_idx]
+                loss, stats = self.loss_fn(pred2=pred2, gt2=gt2, effective_weights=eff_w, return_stats=True)
+                total_loss = total_loss + loss / bsz
+                for k, v in stats.items():
+                    batch_stats_accum[k] = batch_stats_accum.get(k, 0.0) + float(v) / bsz
+
+            total_loss.backward()
+            if self.grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+            self.optimizer.step()
+
+            batch_stats_accum['loss'] = float(total_loss.item())
+            for k, v in batch_stats_accum.items():
+                metrics[k] = metrics.get(k, 0.0) + float(v)
+            count += 1
+            iterator.set_postfix(loss=f"{batch_stats_accum['loss']:.4f}", vec2=f"{batch_stats_accum.get('vec2_loss', float('nan')):.4f}")
+
+        for k in list(metrics.keys()):
+            metrics[k] /= max(count, 1)
+        return metrics
+
+    @torch.no_grad()
+    def validate_one_epoch(self, loader: DataLoader, epoch: int, num_epochs: int) -> dict[str, float]:
+        self.model.eval()
+        metrics: dict[str, float] = {}
+        count = 0
+        iterator = tqdm(loader, desc=f'val   {epoch}/{num_epochs}', leave=False, dynamic_ncols=True)
+        for batch in iterator:
+            batch = self._move_batch(batch)
+            batch_stats_accum: dict[str, float] = {}
+            bsz = batch.curve_points.shape[0]
+            for b in range(bsz):
+                n = batch.curve_points.shape[1]
+                all_idx = torch.arange(n, device=self.device, dtype=torch.long)
+                pred2, eff_w = self._predict_direct_second(batch.curve_points[b], all_idx)
+                gt2 = batch.gt_second[b, all_idx]
+                _, stats = self.loss_fn(pred2=pred2, gt2=gt2, effective_weights=eff_w, return_stats=True)
+                for k, v in stats.items():
+                    batch_stats_accum[k] = batch_stats_accum.get(k, 0.0) + float(v) / bsz
+            for k, v in batch_stats_accum.items():
+                metrics[k] = metrics.get(k, 0.0) + float(v)
+            count += 1
+        for k in list(metrics.keys()):
+            metrics[k] /= max(count, 1)
+        return metrics
+
+    @staticmethod
+    def _print_epoch_summary(epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
+        print(f"\nEpoch {epoch}", flush=True)
+        print(
+            "train | "
+            f"loss={train_metrics.get('loss', float('nan')):.4f} "
+            f"vec2={train_metrics.get('vec2_loss', float('nan')):.4f} "
+            f"cos2_loss={train_metrics.get('cos2_loss', float('nan')):.4f} "
+            f"log2={train_metrics.get('log2_loss', float('nan')):.4f} "
+            f"rowsum={train_metrics.get('rowsum_loss', float('nan')):.4f}",
+            flush=True,
+        )
+        print(
+            "val   | "
+            f"loss={val_metrics.get('loss', float('nan')):.4f} "
+            f"vec2={val_metrics.get('vec2_loss', float('nan')):.4f} "
+            f"cos2_loss={val_metrics.get('cos2_loss', float('nan')):.4f} "
+            f"log2={val_metrics.get('log2_loss', float('nan')):.4f} "
+            f"rowsum={val_metrics.get('rowsum_loss', float('nan')):.4f}",
+            flush=True,
+        )
+
+    def fit(self, *, train_loader: DataLoader, val_loader: DataLoader, test_loader: DataLoader, num_epochs: int, early_stopping_patience: int, seed: int) -> dict[str, object]:
+        before_val = self._full_evaluate_loader(val_loader, split_name='val', tag='before')
+        before_test = self._full_evaluate_loader(test_loader, split_name='test', tag='before')
+
+        best_val = float('inf')
+        best_epoch = 0
+        patience = 0
+        best_model_path = self.checkpoint_dir / 'best_model.pt'
+        torch.save(self.model.state_dict(), self.checkpoint_dir / 'init_model.pt')
+
+        history: list[dict[str, object]] = []
+        for epoch in range(1, num_epochs + 1):
+            train_metrics = self.train_one_epoch(train_loader, epoch=epoch, num_epochs=num_epochs, seed=seed)
+            val_metrics = self.validate_one_epoch(val_loader, epoch=epoch, num_epochs=num_epochs)
+            self._print_epoch_summary(epoch, train_metrics, val_metrics)
+
+            val_loss = float(val_metrics.get('loss', float('inf')))
+            if self.scheduler is not None:
+                self.scheduler.step(val_loss)
+                current_lr = self.optimizer.param_groups[0]['lr']
+                print(f'lr={current_lr:.6g}', flush=True)
+
+            if val_loss < best_val:
+                best_val = val_loss
+                best_epoch = epoch
+                patience = 0
+                torch.save(self.model.state_dict(), best_model_path)
+                print('✓ saved new best model', flush=True)
+            else:
+                patience += 1
+                print(f'no improvement ({patience}/{early_stopping_patience})', flush=True)
+
+            history.append({'epoch': epoch, 'train': train_metrics, 'val': val_metrics})
+            if patience >= early_stopping_patience:
+                print('Early stopping triggered', flush=True)
+                break
+
+        self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+        after_val = self._full_evaluate_loader(val_loader, split_name='val', tag='after')
+        after_test = self._full_evaluate_loader(test_loader, split_name='test', tag='after')
+
+        summary = {
+            'best_epoch': best_epoch,
+            'best_val_loss': best_val,
+            'history': history,
+            'before': {'val': before_val.metrics, 'test': before_test.metrics},
+            'after': {'val': after_val.metrics, 'test': after_test.metrics},
+        }
+        with open(self.checkpoint_dir / 'summary.json', 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2)
+        return summary
