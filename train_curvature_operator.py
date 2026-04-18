@@ -38,10 +38,13 @@ def parse_args():
     p.add_argument("--operator-hidden-dims", type=str, default="256,256")
 
     # loss
-    p.add_argument("--lambda-mse", type=float, default=1.0)
+    p.add_argument("--lambda-rel", type=float, default=1.0)
+    p.add_argument("--lambda-abs", type=float, default=0.05)
     p.add_argument("--lambda-cos", type=float, default=0.0)
-    p.add_argument("--lambda-reg", type=float, default=1e-4)
-    p.add_argument("--lambda-weight-sum", type=float, default=1e-3)
+    p.add_argument("--lambda-reg", type=float, default=1e-2)
+    p.add_argument("--lambda-weight-sum", type=float, default=1e-2)
+    p.add_argument("--tau-scale", type=float, default=1.0)
+    p.add_argument("--tau-min", type=float, default=1e-3)
 
     return p.parse_args()
 
@@ -81,10 +84,13 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     loss_fn = CurvatureVectorLoss(
-        lambda_mse=args.lambda_mse,
+        lambda_rel=args.lambda_rel,
+        lambda_abs=args.lambda_abs,
         lambda_cos=args.lambda_cos,
         lambda_reg=args.lambda_reg,
         lambda_weight_sum=args.lambda_weight_sum,
+        tau_scale=args.tau_scale,
+        tau_min=args.tau_min,
     )
 
     trainer = CurvatureTrainer(
