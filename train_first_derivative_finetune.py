@@ -39,7 +39,7 @@ def flip_operator_sign(model):
             last_linear.bias.mul_(-1.0)
 
 @torch.no_grad()
-def estimate_signed_cosine(model, loader, device, max_batches=5):
+def quick_signed_cosine_check(model, loader, device, max_batches=5):
     model.eval()
     vals = []
 
