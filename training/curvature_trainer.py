@@ -103,8 +103,9 @@ class CurvatureTrainer:
             n += 1
 
             iterator.set_postfix(
-                loss=f"{out.stats['loss']:.4f}",
-                mse=f"{out.stats.get('mse', float('nan')):.4f}",
+                loss=f"{out.stats.get('loss', float('nan')):.4f}",
+                rel=f"{out.stats.get('rel_loss', float('nan')):.4f}",
+                abs=f"{out.stats.get('abs_mse', float('nan')):.4f}",
                 cos=f"{out.stats.get('cosine_mean', float('nan')):.3f}",
             )
 
@@ -125,14 +126,27 @@ class CurvatureTrainer:
 
             print(f"\nEpoch {epoch}")
             print(
-                f"train | loss={train_metrics['loss']:.4f} "
-                f"mse={train_metrics['mse']:.6f} "
-                f"cos={train_metrics['cosine_mean']:.4f}"
+                f"train | loss={train_metrics.get('loss', float('nan')):.4f} "
+                f"rel={train_metrics.get('rel_loss', float('nan')):.6f} "
+                f"abs={train_metrics.get('abs_mse', float('nan')):.6f} "
+                f"cos={train_metrics.get('cosine_mean', float('nan')):.4f} "
+                f"tau={train_metrics.get('tau', float('nan')):.6f} "
+                f"wsum={train_metrics.get('weight_sum_abs_mean', float('nan')):.6f}"
             )
             print(
-                f"val   | loss={val_metrics['loss']:.4f} "
-                f"mse={val_metrics['mse']:.6f} "
-                f"cos={val_metrics['cosine_mean']:.4f}"
+                f"val   | loss={val_metrics.get('loss', float('nan')):.4f} "
+                f"rel={val_metrics.get('rel_loss', float('nan')):.6f} "
+                f"abs={val_metrics.get('abs_mse', float('nan')):.6f} "
+                f"cos={val_metrics.get('cosine_mean', float('nan')):.4f} "
+                f"tau={val_metrics.get('tau', float('nan')):.6f} "
+                f"wsum={val_metrics.get('weight_sum_abs_mean', float('nan')):.6f}"
+            )
+            print(
+                f"norms | gt_mean={val_metrics.get('gt_norm_mean', float('nan')):.6f} "
+                f"gt_med={val_metrics.get('gt_norm_median', float('nan')):.6f} "
+                f"gt_p90={val_metrics.get('gt_norm_p90', float('nan')):.6f} "
+                f"gt_p99={val_metrics.get('gt_norm_p99', float('nan')):.6f} "
+                f"gt_max={val_metrics.get('gt_norm_max', float('nan')):.6f}"
             )
 
             if self.scheduler is not None:
