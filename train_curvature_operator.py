@@ -39,9 +39,9 @@ def parse_args():
 
     # loss
     p.add_argument("--lambda-rel", type=float, default=1.0)
-    p.add_argument("--lambda-abs", type=float, default=0.05)
+    p.add_argument("--lambda-mag", type=float, default=0.05)
     p.add_argument("--lambda-cos", type=float, default=0.0)
-    p.add_argument("--lambda-reg", type=float, default=1e-2)
+    p.add_argument("--lambda-reg", type=float, default=1e-3)
     p.add_argument("--lambda-weight-sum", type=float, default=1e-2)
     p.add_argument("--tau-scale", type=float, default=1.0)
     p.add_argument("--tau-min", type=float, default=1e-3)
@@ -85,7 +85,7 @@ def main():
 
     loss_fn = CurvatureVectorLoss(
         lambda_rel=args.lambda_rel,
-        lambda_abs=args.lambda_abs,
+        lambda_mag=args.lambda_mag,
         lambda_cos=args.lambda_cos,
         lambda_reg=args.lambda_reg,
         lambda_weight_sum=args.lambda_weight_sum,

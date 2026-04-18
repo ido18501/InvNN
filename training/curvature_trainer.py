@@ -105,8 +105,9 @@ class CurvatureTrainer:
             iterator.set_postfix(
                 loss=f"{out.stats.get('loss', float('nan')):.4f}",
                 rel=f"{out.stats.get('rel_loss', float('nan')):.4f}",
-                abs=f"{out.stats.get('abs_mse', float('nan')):.4f}",
+                mag=f"{out.stats.get('mag_loss', float('nan')):.4f}",
                 cos=f"{out.stats.get('cosine_mean', float('nan')):.3f}",
+                ratio=f"{out.stats.get('pred_norm_ratio_mean', float('nan')):.3f}",
             )
 
         for k in metrics:
@@ -128,7 +129,7 @@ class CurvatureTrainer:
             print(
                 f"train | loss={train_metrics.get('loss', float('nan')):.4f} "
                 f"rel={train_metrics.get('rel_loss', float('nan')):.6f} "
-                f"abs={train_metrics.get('abs_mse', float('nan')):.6f} "
+                f"mag={train_metrics.get('mag_loss', float('nan')):.6f} "
                 f"cos={train_metrics.get('cosine_mean', float('nan')):.4f} "
                 f"tau={train_metrics.get('tau', float('nan')):.6f} "
                 f"wsum={train_metrics.get('weight_sum_abs_mean', float('nan')):.6f}"
@@ -136,17 +137,23 @@ class CurvatureTrainer:
             print(
                 f"val   | loss={val_metrics.get('loss', float('nan')):.4f} "
                 f"rel={val_metrics.get('rel_loss', float('nan')):.6f} "
-                f"abs={val_metrics.get('abs_mse', float('nan')):.6f} "
+                f"mag={val_metrics.get('mag_loss', float('nan')):.6f} "
                 f"cos={val_metrics.get('cosine_mean', float('nan')):.4f} "
                 f"tau={val_metrics.get('tau', float('nan')):.6f} "
                 f"wsum={val_metrics.get('weight_sum_abs_mean', float('nan')):.6f}"
             )
             print(
-                f"norms | gt_mean={val_metrics.get('gt_norm_mean', float('nan')):.6f} "
+                f"norms | pred_mean={val_metrics.get('pred_norm_mean', float('nan')):.6f} "
+                f"pred_med={val_metrics.get('pred_norm_median', float('nan')):.6f} "
+                f"gt_mean={val_metrics.get('gt_norm_mean', float('nan')):.6f} "
                 f"gt_med={val_metrics.get('gt_norm_median', float('nan')):.6f} "
-                f"gt_p90={val_metrics.get('gt_norm_p90', float('nan')):.6f} "
-                f"gt_p99={val_metrics.get('gt_norm_p99', float('nan')):.6f} "
-                f"gt_max={val_metrics.get('gt_norm_max', float('nan')):.6f}"
+                f"ratio_mean={val_metrics.get('pred_norm_ratio_mean', float('nan')):.6f} "
+                f"ratio_med={val_metrics.get('pred_norm_ratio_median', float('nan')):.6f}"
+            )
+            print(
+                f"gt tail | p90={val_metrics.get('gt_norm_p90', float('nan')):.6f} "
+                f"p99={val_metrics.get('gt_norm_p99', float('nan')):.6f} "
+                f"max={val_metrics.get('gt_norm_max', float('nan')):.6f}"
             )
 
             if self.scheduler is not None:
