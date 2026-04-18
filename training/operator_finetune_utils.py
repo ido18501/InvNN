@@ -84,6 +84,48 @@ def load_pretrained_run(run_dir: str | Path) -> tuple[Path, dict[str, Any], Path
     return best_model_path, cfg, config_path
 
 
+def _parse_int_list(value: Any, name: str) -> list[int]:
+    if value is None:
+        return []
+
+    if isinstance(value, bool):
+        raise ValueError(f'{name} is bool, expected int list: {value}')
+
+    if isinstance(value, int):
+        return [int(value)]
+
+    if isinstance(value, (list, tuple)):
+        out: list[int] = []
+        for x in value:
+            if isinstance(x, bool):
+                raise ValueError(f'{name} contains bool, expected ints: {value}')
+            out.append(int(x))
+        return out
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        return [int(x.strip()) for x in text.split(',') if x.strip()]
+
+    raise ValueError(f'Unsupported type for {name}: type={type(value)} value={value}')
+
+
+def _parse_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {'true', '1', 'yes', 'y'}:
+            return True
+        if text in {'false', '0', 'no', 'n'}:
+            return False
+        raise ValueError(f'Could not parse bool field {name} from string: {value}')
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raise ValueError(f'Unsupported type for bool field {name}: type={type(value)} value={value}')
+
+
 def instantiate_model_from_pretrained_config(cfg: dict[str, Any]) -> TangentOperatorModel:
     missing = [k for k in REQUIRED_MODEL_CONFIG_FIELDS if k not in cfg]
     if missing:
@@ -91,15 +133,18 @@ def instantiate_model_from_pretrained_config(cfg: dict[str, Any]) -> TangentOper
 
     model = TangentOperatorModel(
         patch_size=int(cfg['patch_size']),
-        operator_hidden_dims=list(cfg['operator_hidden_dims']),
-        signature_hidden_dims=list(cfg['signature_hidden_dims']),
+        operator_hidden_dims=_parse_int_list(cfg['operator_hidden_dims'], 'operator_hidden_dims'),
+        signature_hidden_dims=_parse_int_list(cfg['signature_hidden_dims'], 'signature_hidden_dims'),
         signature_out_dim=int(cfg['signature_out_dim']),
         signature_center_radius=int(cfg['signature_center_radius']),
         head_dropout=float(cfg['head_dropout']),
-        normalize_projector=not bool(cfg['disable_normalize_projector']),
+        normalize_projector=not _parse_bool(cfg['disable_normalize_projector'], 'disable_normalize_projector'),
         init_scale=float(cfg['operator_init_scale']),
-        learn_scale=bool(cfg['learn_output_scale']),
-        centered_input_for_operator=not bool(cfg['disable_centered_input_for_operator']),
+        learn_scale=_parse_bool(cfg['learn_output_scale'], 'learn_output_scale'),
+        centered_input_for_operator=not _parse_bool(
+            cfg['disable_centered_input_for_operator'],
+            'disable_centered_input_for_operator',
+        ),
     )
     return model
 

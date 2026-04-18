@@ -81,6 +81,19 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     best_model_path, pretrained_cfg, pretrained_config_path = load_pretrained_run(args.pretrained_run_dir)
+
+    print('patch_size raw:', pretrained_cfg.get('patch_size'), type(pretrained_cfg.get('patch_size')))
+    print('operator_hidden_dims raw:', pretrained_cfg.get('operator_hidden_dims'),
+          type(pretrained_cfg.get('operator_hidden_dims')))
+    print('signature_hidden_dims raw:', pretrained_cfg.get('signature_hidden_dims'),
+          type(pretrained_cfg.get('signature_hidden_dims')))
+    print('disable_normalize_projector raw:', pretrained_cfg.get('disable_normalize_projector'),
+          type(pretrained_cfg.get('disable_normalize_projector')))
+    print('learn_output_scale raw:', pretrained_cfg.get('learn_output_scale'),
+          type(pretrained_cfg.get('learn_output_scale')))
+    print('disable_centered_input_for_operator raw:', pretrained_cfg.get('disable_centered_input_for_operator'),
+          type(pretrained_cfg.get('disable_centered_input_for_operator')))
+
     model = instantiate_model_from_pretrained_config(pretrained_cfg)
     state = torch.load(best_model_path, map_location='cpu')
     model.load_state_dict(state)
