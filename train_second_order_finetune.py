@@ -97,6 +97,18 @@ def main() -> None:
     model = instantiate_model_from_pretrained_config(pretrained_cfg)
     state = torch.load(best_model_path, map_location='cpu')
     model.load_state_dict(state)
+
+    print('\n[instantiated operator head linear layers]')
+    for module in model.operator_head.net:
+        if isinstance(module, torch.nn.Linear):
+            print(module.in_features, '->', module.out_features)
+
+    print('\n[instantiated signature head linear layers]')
+    for module in model.signature_head.net:
+        if isinstance(module, torch.nn.Linear):
+            print(module.in_features, '->', module.out_features)
+
+    model = model.to(torch.device(args.device))
     freeze_signature_head(model)
 
     train_bank = PregeneratedCurveBank(args.train_bank)
