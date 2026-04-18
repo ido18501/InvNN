@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
-
 import torch
+import torch.nn as nn
+from pathlib import Path
 from torch.utils.data import DataLoader
 
 try:
@@ -23,6 +23,53 @@ except Exception:
     from collate import tangent_collate_fn
 
 
+def flip_operator_sign(model):
+    last_linear = None
+    for module in reversed(model.operator_head.net):
+        if isinstance(module, nn.Linear):
+            last_linear = module
+            break
+
+    if last_linear is None:
+        raise RuntimeError("Could not find final Linear layer in model.operator_head.net")
+
+    with torch.no_grad():
+        last_linear.weight.mul_(-1.0)
+        if last_linear.bias is not None:
+            last_linear.bias.mul_(-1.0)
+
+@torch.no_grad()
+def estimate_signed_cosine(model, loader, device, max_batches=5):
+    model.eval()
+    vals = []
+
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= max_batches:
+            break
+
+        anchor = batch.anchor.to(device)
+        gt = batch.gt_first_anchor.to(device)
+        has_analytic = batch.has_analytic_derivatives.to(device)
+
+        out = model(anchor)
+        pred = out["pred"]
+
+        valid = has_analytic.bool() & torch.isfinite(gt).all(dim=-1)
+        if valid.sum().item() == 0:
+            continue
+
+        pred = pred[valid]
+        gt = gt[valid]
+
+        pred_n = pred / (pred.norm(dim=-1, keepdim=True) + 1e-8)
+        gt_n = gt / (gt.norm(dim=-1, keepdim=True) + 1e-8)
+        cos = (pred_n * gt_n).sum(dim=-1)
+
+        vals.append(cos.mean().item())
+
+    if not vals:
+        return float("nan")
+    return sum(vals) / len(vals)
 
 def parse_int_list(text: str) -> list[int]:
     text = text.strip()
@@ -180,6 +227,19 @@ def main():
     model = build_model(args)
     state = torch.load(args.pretrained_checkpoint, map_location='cpu')
     model.load_state_dict(state, strict=True)
+
+    model.to(device)
+
+    # 🔍 Check sign
+    init_cos = quick_signed_cosine_check(model, val_loader, device)
+    print(f"[pre-ft sign check] mean cosine = {init_cos:.6f}")
+
+    if init_cos < 0:
+        print("[pre-ft] Detected flipped operator → applying sign flip")
+        flip_operator_sign(model)
+
+        flipped_cos = quick_signed_cosine_check(model, val_loader, device)
+        print(f"[pre-ft] cosine after flip = {flipped_cos:.6f}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = None
