@@ -210,6 +210,7 @@ def build_model(args) -> TangentOperatorModel:
 
 def main():
     args = parse_args()
+    device = torch.device(args.device)
     torch.manual_seed(args.seed)
 
     checkpoint_dir = Path(args.checkpoint_dir)
