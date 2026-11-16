@@ -1,28 +1,24 @@
-# Invariant Operator Project
+# Equivariant Neural Operators on Curves
 
-This is a standalone rewrite of the tangent-operator project around an **invariant-only training objective**.
+PyTorch experiments on learning local curve operators from transformed patches. Training uses transformation consistency and contrastive comparisons, without derivative labels.
 
-## Goal
+## Training objective
 
-Train a model on local curve patches using only invariance over a transformation family.
-The model never sees derivative labels during optimization.
+The current `EquivariantVectorLoss` in `training/losses.py` combines:
 
-The model learns:
-- an invariant embedding `z(patch)`
-- a single scalar stencil `W` predicted from that invariant code
+- raw vector equivariance;
+- InfoNCE on operator outputs;
+- L2 regularization of predicted weights;
+- a norm-floor penalty that discourages zero outputs.
 
-Then for diagnostics only:
-- `W(x)` is compared to the exact analytic Euclidean arc-length first derivative
-- `W(W(x))` is compared to the exact analytic Euclidean arc-length second derivative
-
-Those derivative comparisons are **never used in the loss**.
+Analytic first- and second-derivative comparisons are used for monitoring.
 
 ## Directory layout
 
-Create a fresh project directory and place the files exactly like this:
+The core implementation is organized as follows:
 
 ```text
-invariant_operator_project/
+InvNN/
 ├── README.md
 ├── requirements.txt
 ├── datasets/
@@ -63,7 +59,7 @@ Use a precomputed `.npz` file with:
 
 This preserves exact analytic derivative diagnostics.
 
-## Important behavior preserved
+## Sampling and training
 
 - random Fourier curves
 - optional global warp of the full curve sampling
@@ -119,6 +115,3 @@ python scripts/evaluate_checkpoint.py \
 - If derivative labels are unavailable, the trainer will skip those diagnostics safely.
 
 
-## Current training objective
-
-This project now trains the operator with an equivariant-contrastive objective, not an invariant embedding loss. The loss uses only: InfoNCE on projected first-order outputs, raw first-order equivariance, zero-sum stencil bias, and small L2 regularization. Analytic first and second derivatives are logged for monitoring only and never used as labels during optimization.
